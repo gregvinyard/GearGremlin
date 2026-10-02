@@ -1,9 +1,11 @@
 # Here you define the commands that will be added to your add-in.
 from .gearProfile import entry as gearProfile
+from .planetary import entry as planetary
 
 # Fusion will automatically call the start() and stop() functions.
 commands = [
     gearProfile,
+    planetary,
 ]
 
 

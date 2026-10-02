@@ -14,6 +14,7 @@ from matplotlib.patches import Circle, Polygon  # noqa: E402
 import gearmath as gm  # noqa: E402
 
 OUT = os.path.join(ROOT, 'commands', 'gearProfile', 'resources')
+OUT_PLANETARY = os.path.join(ROOT, 'commands', 'planetary', 'resources')
 
 
 def outline(profile):
@@ -44,5 +45,30 @@ def main():
         plt.close(fig)
 
 
+def planetary_icons():
+    os.makedirs(OUT_PLANETARY, exist_ok=True)
+    a = math.radians(25)
+    sun = gm.build_profile(gm.GearParams(1.0, 8, a), theta0=0.2, points_per_flank=6)
+    planets = []
+    for i in range(3):
+        ang = math.pi / 2 + 2 * math.pi * i / 3
+        planets.append(gm.build_profile(gm.GearParams(1.0, 6, a), center=(7 * math.cos(ang), 7 * math.sin(ang)),
+                                        theta0=ang, points_per_flank=6))
+    for size in (16, 32, 64):
+        fig = plt.figure(figsize=(1, 1), dpi=size)
+        ax = fig.add_axes([0, 0, 1, 1])
+        lw = max(0.4, size / 64)
+        ax.add_patch(Circle((0, 0), 11.2, facecolor='none', edgecolor='#1d3d66', linewidth=2.2 * lw))
+        ax.add_patch(Polygon(outline(sun), closed=True, facecolor='#4a7fc1', edgecolor='#1d3d66', linewidth=lw))
+        for p in planets:
+            ax.add_patch(Polygon(outline(p), closed=True, facecolor='#e0a040', edgecolor='#6a4a10', linewidth=lw))
+        ax.set_xlim(-12, 12)
+        ax.set_ylim(-12, 12)
+        ax.axis('off')
+        fig.savefig(os.path.join(OUT_PLANETARY, f'{size}x{size}.png'), transparent=True)
+        plt.close(fig)
+
+
 if __name__ == '__main__':
     main()
+    planetary_icons()

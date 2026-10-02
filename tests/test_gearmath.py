@@ -9,14 +9,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import gearmath as gm  # noqa: E402
 
 DEG20 = math.radians(20)
+B = 0.05  # default backlash
 
 
-def ext(z: int, m: float = 2.0, alpha: float = DEG20, backlash: float = 0.0) -> gm.GearParams:
-    return gm.GearParams(m, z, alpha, backlash, gm.EXTERNAL)
+def ext(z: int, m: float = 2.0, alpha: float = DEG20, backlash: float = 0.0, k: float = 1.0) -> gm.GearParams:
+    return gm.GearParams(m, z, alpha, backlash, gm.EXTERNAL, k)
 
 
-def ring(z: int, m: float = 2.0, alpha: float = DEG20, backlash: float = 0.0) -> gm.GearParams:
-    return gm.GearParams(m, z, alpha, backlash, gm.INTERNAL)
+def ring(z: int, m: float = 2.0, alpha: float = DEG20, backlash: float = 0.0, k: float = 1.0) -> gm.GearParams:
+    return gm.GearParams(m, z, alpha, backlash, gm.INTERNAL, k)
 
 
 def polar_of(center, p):
@@ -36,7 +37,8 @@ def test_inverse_involute_roundtrip():
 
 
 @pytest.mark.parametrize('params', [ext(22), ext(8, backlash=0.2), ring(60), ring(40, backlash=0.15),
-                                    ext(30, alpha=math.radians(14.5)), ext(12, alpha=math.radians(25))])
+                                    ext(30, alpha=math.radians(14.5)), ext(12, alpha=math.radians(25)),
+                                    ext(20, k=0.8), ring(50, k=1.2)])
 def test_half_thickness_at_pitch_circle_equals_psi(params):
     assert gm.flank_angle(params, params.pitch_radius) == pytest.approx(params.half_angle, abs=1e-12)
 
@@ -44,7 +46,6 @@ def test_half_thickness_at_pitch_circle_equals_psi(params):
 def test_backlash_thins_teeth_and_widens_spaces_by_half():
     b = 0.2
     e0, e1 = ext(20), ext(20, backlash=b)
-    # arc-length thickness at the pitch circle drops by B/2
     assert 2 * e0.pitch_radius * (e0.half_angle - e1.half_angle) == pytest.approx(b / 2)
     r0, r1 = ring(60), ring(60, backlash=b)
     assert 2 * r0.pitch_radius * (r1.half_angle - r0.half_angle) == pytest.approx(b / 2)
@@ -58,10 +59,135 @@ def test_suggest_teeth_is_round_d_over_m(d, m, z):
     assert gm.suggest_teeth(d, m) == round(d / m) == z
 
 
+# --- tooth height factor ----------------------------------------------------
+
+def test_factor_sets_addendum_and_dedendum():
+    p = ext(20, k=0.8)
+    assert p.tip_radius == pytest.approx(20 + 1.6)
+    assert p.root_radius == pytest.approx(20 - 2.1)
+    r = ring(60, k=0.8)
+    assert r.tip_radius == pytest.approx(60 - 1.6)
+    assert r.root_radius == pytest.approx(60 + 2.1)
+
+
+@pytest.mark.parametrize('params', [ext(10), ext(20), ext(40), ext(15, backlash=B), ext(12, alpha=math.radians(25))])
+def test_factor_max_is_where_the_tip_gets_too_narrow(params):
+    k_max = gm.factor_max(params)
+    assert gm.FACTOR_SCAN_MIN < k_max < gm.FACTOR_CAP
+    at_max = params.with_factor(k_max)
+    assert gm.factor_geometry_ok(at_max)
+    assert not gm.factor_geometry_ok(params.with_factor(k_max + 0.01))
+    # At the maximum, the binding limit is the 0.2·m top land.
+    assert gm.top_land(at_max) == pytest.approx(gm.MIN_TOP_LAND * params.module, abs=0.01 * params.module)
+
+
+@pytest.mark.parametrize('a, b', [(ext(20, backlash=B), ext(30, backlash=B)),
+                                  (ext(14, backlash=B), ext(40, backlash=B)),
+                                  (ring(60, backlash=B), ext(15, backlash=B)),
+                                  (ring(80, backlash=B), ext(20, backlash=B))])
+def test_factor_min_is_where_contact_ratio_reaches_1_2(a, b):
+    k_min = gm.factor_min_pair(a, b)
+    assert k_min is not None
+    cr_at = gm.pair_contact_ratio(a.with_factor(k_min), b.with_factor(k_min))
+    cr_below = gm.pair_contact_ratio(a.with_factor(k_min - 0.03), b.with_factor(k_min - 0.03))
+    assert cr_at == pytest.approx(gm.CONTACT_RATIO_GOOD, abs=0.02)
+    assert cr_below < gm.CONTACT_RATIO_GOOD
+
+
+def test_factor_range_without_partner_uses_fixed_floor():
+    lo, hi = gm.factor_range(ext(20))
+    assert lo == gm.FACTOR_FLOOR
+    assert hi == gm.factor_max(ext(20))
+
+
+def test_factor_limits_enforced_in_check_params():
+    assert not gm.check_params(ext(20, k=1.0)).errors
+    assert gm.check_params(ext(20, k=gm.factor_max(ext(20)) + 0.05)).errors
+    assert gm.check_params(ext(20, k=0.5)).errors
+
+
+def test_factor_mismatch_blocks_mesh():
+    check = gm.check_mesh(ext(20, k=0.8), (0, 0), ext(20, k=1.0), (40, 0), 20)
+    assert any('Tooth height' in e for e in check.errors)
+    assert not gm.check_mesh(ext(20, k=0.8), (0, 0), ext(20, k=0.8), (40, 0), 20).errors
+
+
+def test_pair_report_low_contact_ratio_names_the_fix():
+    a, b = ext(20, backlash=B, k=0.65), ext(30, backlash=B, k=0.65)
+    report = gm.pair_report(a, gm.gear_radii(a), b)
+    assert any('below 1.2' in w and 'at least' in w for w in report.warnings)
+    assert report.infos and report.infos[0].startswith('Contact ratio')
+
+
+def test_contact_ratio_matches_textbook_for_plain_pair():
+    # 20 + 30 teeth, m = 2, 20°, k = 1: textbook ε ≈ 1.606 (contact stays above both form radii).
+    assert gm.pair_contact_ratio(ext(20), ext(30)) == pytest.approx(1.606, abs=0.005)
+
+
+# --- generated root ----------------------------------------------------------
+
+def test_undercut_threshold_is_17_at_20_degrees():
+    assert gm.undercut_min_teeth(ext(20)) == 17
+    assert gm.undercut_threshold(ext(20, k=0.8)) < gm.undercut_threshold(ext(20))  # stub teeth undercut less
+    assert gm.check_params(ext(17)).warnings
+    assert not any('undercut' in w for w in gm.check_params(ext(18)).warnings)
+    assert any('weaker' in w for w in gm.check_params(ext(10)).warnings)
+
+
+@pytest.mark.parametrize('z', [6, 8, 10, 14, 17, 25, 42, 60, 120])
+def test_generated_root_endpoints_and_join(z):
+    params = ext(z, backlash=B)
+    rs = gm.root_shape(params)
+    radii = gm.gear_radii(params)
+    assert rs.rhos[0] == pytest.approx(params.root_radius)
+    assert rs.rhos[-1] == pytest.approx(rs.form)
+    assert rs.halves[-1] == pytest.approx(gm.flank_angle(params, rs.form), abs=1e-12)
+    assert params.root_radius < rs.form < radii.tip
+    # Half-angle at the root never exceeds half the angular pitch (teeth don't overlap at the root).
+    assert rs.halves[0] <= params.angular_pitch / 2 + 1e-12
+
+
+def _cutter_outline(params):
+    cut = gm.cutter(params)
+    a, r, m = params.pressure_angle, params.pitch_radius, params.module
+    pts = []
+    for i in range(80):  # straight flank, from above the pitch line down to where it meets the corner
+        d = -1.5 * m + (cut.straight_depth + 1.5 * m) * i / 79
+        pts.append((cut.half_width - d * math.tan(a), r - d))
+    for i in range(40):  # rounded corner
+        th = -a - (math.pi / 2 - a) * i / 39
+        pts.append((cut.corner_x + cut.corner_radius * math.cos(th),
+                    r - cut.corner_depth + cut.corner_radius * math.sin(th)))
+    pts.append((0.0, r - cut.depth))
+    return pts
+
+
+@pytest.mark.parametrize('z', [8, 10, 14, 17, 30, 60])
+def test_cutter_never_cuts_into_the_drawn_tooth(z):
+    """Brute force: sweep the actual cutter outline; no cutter point may lie inside the drawn tooth."""
+    params = ext(z, backlash=B)
+    r, tau = params.pitch_radius, params.angular_pitch
+    tip = gm.gear_radii(params).tip
+    worst = 0.0
+    for j in range(1500):
+        t = -0.9 * tau + 2.4 * tau * j / 1499
+        c, s = math.cos(-t), math.sin(-t)
+        for (x, y) in _cutter_outline(params):
+            wx = x - r * t
+            gx, gy = wx * c - y * s, wx * s + y * c
+            rho = math.hypot(gx, gy)
+            if rho >= tip or rho <= params.root_radius:
+                continue
+            half = math.atan2(gy, gx) - math.pi / 2 + tau / 2      # angle from the tooth on this side
+            depth = gm.tooth_half_angle(params, rho) - half          # > 0: cutter point inside the tooth
+            worst = max(worst, depth * rho)
+    assert worst < 0.01 * params.module
+
+
 # --- profile geometry -------------------------------------------------------
 
 ALL_PROFILES = [ext(22), ext(8), ext(50), ext(17, backlash=0.15), ring(60), ring(24), ring(45, backlash=0.1),
-                ext(13, alpha=math.radians(14.5)), ring(30, alpha=math.radians(25))]
+                ext(13, alpha=math.radians(14.5)), ring(30, alpha=math.radians(25)), ext(20, k=0.8), ring(60, k=0.8)]
 
 
 @pytest.mark.parametrize('params', ALL_PROFILES)
@@ -73,33 +199,26 @@ def test_profile_is_closed_loop(params):
 
 
 @pytest.mark.parametrize('params', ALL_PROFILES)
-def test_flank_endpoints_land_on_stated_radii(params):
+def test_segment_endpoints_land_on_stated_radii(params):
     center = (3.0, -7.0)
     prof = gm.build_profile(params, center=center, theta0=0.3)
-    involute_start = max(params.base_radius, min(prof.tip_radius, prof.root_radius))
-    outer = max(prof.tip_radius, prof.root_radius)
-    inner = min(prof.tip_radius, prof.root_radius)
+    radii = prof.radii
+    allowed = sorted({radii.tip, radii.root, radii.form})
     for seg in prof.segments:
-        if isinstance(seg, gm.Spline):
-            ends = sorted(polar_of(center, p)[0] for p in (seg.start, seg.end))
-            assert ends[0] == pytest.approx(involute_start, abs=1e-9)
-            assert ends[1] == pytest.approx(outer, abs=1e-9)
-        elif isinstance(seg, gm.Line):
-            ends = sorted(polar_of(center, p)[0] for p in (seg.start, seg.end))
-            assert ends == pytest.approx([inner, params.base_radius], abs=1e-9)
-        else:
-            assert seg.radius in (pytest.approx(inner), pytest.approx(outer))
+        for p in (seg.start, seg.end):
+            rho = polar_of(center, p)[0]
+            assert min(abs(rho - a) for a in allowed) < 1e-9
+        if isinstance(seg, gm.Arc):
+            assert seg.radius in (pytest.approx(radii.tip), pytest.approx(radii.root))
             assert seg.sweep > 0
 
 
-def test_external_radii_and_radial_foot():
-    small = gm.build_profile(ext(20))  # rf < rb, needs radial lines
-    assert small.tip_radius == pytest.approx(22.0)
-    assert small.root_radius == pytest.approx(17.5)
-    assert any(isinstance(s, gm.Line) for s in small.segments)
-    big = gm.build_profile(ext(60))  # rf > rb
-    assert not any(isinstance(s, gm.Line) for s in big.segments)
-    assert len(big.segments) == 60 * 4
+def test_external_radii():
+    prof = gm.build_profile(ext(20))
+    assert prof.tip_radius == pytest.approx(22.0)
+    assert prof.root_radius == pytest.approx(17.5)
+    assert not any(isinstance(s, gm.Line) for s in prof.segments)  # the radial line is gone
+    assert len(gm.build_profile(ext(60)).segments) == 60 * 6
 
 
 def test_internal_radii():
@@ -110,7 +229,7 @@ def test_internal_radii():
 
 
 def test_internal_tip_clamped_to_base_circle():
-    params = ring(24)  # r − m = 22 < rb = 22.55
+    params = ring(24)
     prof = gm.build_profile(params)
     assert prof.tip_radius == pytest.approx(params.base_radius)
     assert prof.warnings
@@ -127,7 +246,6 @@ def test_pointed_teeth_clamped():
 
 @pytest.mark.parametrize('params', ALL_PROFILES)
 def test_profile_symmetric_about_tooth_centerline(params):
-    """Mirroring the profile across tooth 0's centerline maps it onto itself."""
     theta0 = 0.3
     prof = gm.build_profile(params, theta0=theta0, points_per_flank=12)
     points = [p for s in prof.segments for p in ([s.start, s.mid, s.end] if isinstance(s, gm.Arc) else
@@ -141,21 +259,16 @@ def test_profile_symmetric_about_tooth_centerline(params):
 # --- mesh alignment ---------------------------------------------------------
 
 def nearest(angles_base: float, step: float, target: float) -> float:
-    """Of angles base + k·step, the one nearest target (returned as a signed offset from target)."""
     return wrap(angles_base - target + step * round((target - angles_base) / step))
 
 
 def assert_tooth_faces_gap(a: gm.GearParams, ca, ta, b: gm.GearParams, cb, tb):
-    """Rotate the pair conjugately until a tooth of A points at the contact point, then check that a
-    gap center of B sits exactly at the contact point."""
     d_a, d_b = gm.contact_directions(a.gear_type, ca, b.gear_type, cb)
-    # A's tooth centerlines: θ₀ + kτ for both types (internal teeth too, per SPEC).
-    delta_a = -nearest(ta, a.angular_pitch, d_a)          # rotation of A that brings a tooth to d_a
+    delta_a = -nearest(ta, a.angular_pitch, d_a)
     same_direction = a.internal or b.internal
     delta_b = delta_a * a.teeth / b.teeth * (1 if same_direction else -1)
     gap_offset = nearest(tb + delta_b + b.angular_pitch / 2, b.angular_pitch, d_b)
     assert gap_offset == pytest.approx(0, abs=1e-9)
-    # Contact point: the two pitch circles meet at the same physical point.
     pa = (ca[0] + a.pitch_radius * math.cos(d_a), ca[1] + a.pitch_radius * math.sin(d_a))
     pb = (cb[0] + b.pitch_radius * math.cos(d_b), cb[1] + b.pitch_radius * math.sin(d_b))
     assert pa == pytest.approx(pb, abs=1e-9)
@@ -194,18 +307,35 @@ def test_internal_pair_meshes_after_alignment(zr, zp, angle_deg, t_partner, new_
     assert_tooth_faces_gap(p, cp, tp, r, cr, tr)
 
 
-# Material check: with backlash, densely sampled points of one gear never fall inside the other's teeth.
+@pytest.mark.parametrize('internal', [False, True])
+def test_mesh_error(internal):
+    if internal:
+        a, b = ring(60), ext(20)
+        ca, cb = (0.0, 0.0), (a.pitch_radius - b.pitch_radius, 0.0)
+    else:
+        a, b = ext(22), ext(15)
+        ca, cb = (0.0, 0.0), (a.pitch_radius + b.pitch_radius, 0.0)
+    tb = 0.3
+    ta = gm.align_theta0(a, ca, b, cb, tb)
+    assert gm.mesh_error(a, ca, ta, b, cb, tb) == pytest.approx(0, abs=1e-9)
+    assert gm.mesh_error(b, cb, tb, a, ca, ta) == pytest.approx(0, abs=1e-9)
+    assert gm.mesh_error(a, ca, ta + a.angular_pitch / 2, b, cb, tb) == pytest.approx(0.5)
+    assert gm.mesh_error(a, ca, ta + a.angular_pitch, b, cb, tb) == pytest.approx(0, abs=1e-9)
 
-def dense_polygon(prof: gm.Profile) -> list[tuple[float, float]]:
+
+# --- collision sweeps (independent polygon check, full tooth of rotation) ----
+
+def _points(segments, arc_step=0.01, spline_step=0.03):
     pts = []
-    for s in prof.segments:
+    for s in segments:
         if isinstance(s, gm.Arc):
-            n = max(2, int(s.sweep / 0.01))
+            n = max(2, int(s.sweep / arc_step))
             pts += [s.point_at(s.start_angle + s.sweep * i / n) for i in range(n)]
-        elif isinstance(s, gm.Spline):
-            pts += s.points[:-1]
         else:
-            pts.append(s.start)
+            ps = s.points if isinstance(s, gm.Spline) else [s.start, s.end]
+            for (x0, y0), (x1, y1) in zip(ps, ps[1:]):
+                n = max(1, int(math.hypot(x1 - x0, y1 - y0) / spline_step))
+                pts += [(x0 + (x1 - x0) * i / n, y0 + (y1 - y0) * i / n) for i in range(n)]
     return pts
 
 
@@ -222,51 +352,230 @@ def inside(poly, pt) -> bool:
     return result
 
 
-def test_external_pair_teeth_do_not_overlap():
-    a, b = ext(14, backlash=0.1), ext(23, backlash=0.1)
-    ca, cb = (0.0, 0.0), (a.pitch_radius + b.pitch_radius, 0.0)
-    tb = 0.07
-    ta = gm.align_theta0(a, ca, b, cb, tb)
-    pa = dense_polygon(gm.build_profile(a, ca, ta, points_per_flank=80))
-    pb = dense_polygon(gm.build_profile(b, cb, tb, points_per_flank=80))
-    assert not any(inside(pb, p) for p in pa)
-    assert not any(inside(pa, p) for p in pb)
+def _near(pts, center, radius):
+    return [p for p in pts if math.dist(p, center) < radius]
 
 
-def test_internal_pair_teeth_do_not_overlap():
-    r, p = ring(60, backlash=0.1), ext(20, backlash=0.1)
-    cr = (0.0, 0.0)
+def local_material(loop, center, facing, half_width, close_radius):
+    """Material polygon of one gear near the mesh: the part of its (CCW) profile loop within an
+    angular window, closed by an arc at close_radius (inside for an external gear, outside for a ring)."""
+    def rel(p):
+        return wrap(math.atan2(p[1] - center[1], p[0] - center[0]) - facing)
+    mask = [abs(rel(p)) <= half_width for p in loop]
+    n = len(loop)
+    start = next(i for i in range(n) if mask[i] and not mask[i - 1])
+    chain = []
+    i = start
+    while mask[i % n]:
+        chain.append(loop[i % n])
+        i += 1
+    a0, a1 = rel(chain[0]), rel(chain[-1])
+    arc = [(center[0] + close_radius * math.cos(facing + a1 + (a0 - a1) * j / 40),
+            center[1] + close_radius * math.sin(facing + a1 + (a0 - a1) * j / 40)) for j in range(41)]
+    return chain + arc
+
+
+def in_window(pts, center, facing, half_width):
+    return [p for p in pts if abs(wrap(math.atan2(p[1] - center[1], p[0] - center[0]) - facing)) < half_width]
+
+
+def ring_pinion_collides(zr, zp, backlash=B, k=1.0, steps=24, ignore_flank_contact=False, trim=True):
+    """Polygon sweep: the trimmed ring (as the gear command draws it) against the pinion.
+
+    ignore_flank_contact (for zero backlash, where flanks touch by design): only count hits that
+    involve the pinion's non-working root or the ring's tip.
+    """
+    r, p = ring(zr, backlash=backlash, k=k), ext(zp, backlash=backlash, k=k)
+    r_radii, p_radii = gm.gear_radii(r, (p,) if trim else ()), gm.gear_radii(p)
     cp = (0.0, r.pitch_radius - p.pitch_radius)
-    tr = 0.02
-    tp = gm.align_theta0(p, cp, r, cr, tr)
-    ring_poly = dense_polygon(gm.build_profile(r, cr, tr, points_per_flank=80))
-    pin_poly = dense_polygon(gm.build_profile(p, cp, tp, points_per_flank=80))
-    # Ring material lies outside its profile loop, so every pinion point must be inside it.
-    assert all(inside(ring_poly, q) for q in pin_poly)
+    tr0 = gm.align_theta0(r, (0.0, 0.0), p, cp, 0.0)
+    up = math.pi / 2
+    ring_window = math.asin(min(1.0, (p_radii.tip + 1.0) / cp[1])) + 0.1
+
+    def counts(q):
+        if not ignore_flank_contact:
+            return True
+        return math.dist(q, cp) < p_radii.form - 1e-6 or math.hypot(*q) < r_radii.tip + 0.02
+
+    for i in range(steps):
+        d = i / steps * p.angular_pitch
+        pin_loop = _points(gm.build_profile(p, cp, d, 30).segments)
+        ring_loop = _points(gm.build_profile(r, (0.0, 0.0), tr0 + d * zp / zr, 30, radii=r_radii).segments)
+        pin_mat = local_material(pin_loop, cp, up, 1.4, p_radii.root * 0.5)
+        ring_mat = local_material(ring_loop, (0.0, 0.0), up, ring_window, r_radii.root + 2 * r.module)
+        for q in in_window(ring_loop, cp, up, 1.3):
+            if math.dist(q, cp) < p_radii.tip + 0.1 and inside(pin_mat, q) and counts(q):
+                return True
+        for q in in_window(pin_loop, (0.0, 0.0), up, ring_window - 0.05):
+            if q[1] > cp[1] and inside(ring_mat, q) and counts(q):
+                return True
+    return False
 
 
-def test_misaligned_pair_does_overlap():
-    """Sanity check for the overlap test itself: half a tooth off should collide."""
-    a, b = ext(14, backlash=0.1), ext(23, backlash=0.1)
-    ca, cb = (0.0, 0.0), (a.pitch_radius + b.pitch_radius, 0.0)
-    ta = gm.align_theta0(a, ca, b, cb, 0.0) + a.angular_pitch / 2
-    pa = dense_polygon(gm.build_profile(a, ca, ta, points_per_flank=40))
-    pb = dense_polygon(gm.build_profile(b, cb, 0.0, points_per_flank=40))
-    assert any(inside(pb, p) for p in pa)
+@pytest.mark.parametrize('zp', [10, 11, 12, 13, 14])
+def test_small_planets_in_rings_dont_collide_after_trim(zp):
+    """The planetary geometry with sun = 2·planet, so ring = 4·planet."""
+    assert not ring_pinion_collides(4 * zp, zp)
 
 
-# --- validation -------------------------------------------------------------
+def test_small_planet_collides_without_trim():
+    """Sanity check for the sweep itself: the untrimmed ring hits a 10-tooth planet."""
+    r, p = ring(40, backlash=B), ext(10, backlash=B)
+    cp = (0.0, r.pitch_radius - p.pitch_radius)
+    tr0 = gm.align_theta0(r, (0.0, 0.0), p, cp, 0.0)
+    hit = False
+    for i in range(24):
+        d = i / 24 * p.angular_pitch
+        pin_mat = local_material(_points(gm.build_profile(p, cp, d, 30).segments), cp, math.pi / 2, 1.4, 3.0)
+        ring_pts = in_window(_points(gm.build_profile(r, (0.0, 0.0), tr0 + d * 10 / 40, 30).segments), cp,
+                             math.pi / 2, 1.3)
+        if any(inside(pin_mat, q) for q in ring_pts if math.dist(q, cp) < 12.1):
+            hit = True
+            break
+    assert hit
+
+
+def test_ring_trim_at_zero_backlash():
+    assert not ring_pinion_collides(40, 10, backlash=0.0, ignore_flank_contact=True)
+    trim = gm.ring_trim(ring(40), ext(10))
+    assert trim.clears and trim.required_tip > ring(40).tip_radius
+
+
+def ext_pair_collides(za, zb, backlash=B, steps=24, offset=0.0):
+    a, b = ext(za, backlash=backlash), ext(zb, backlash=backlash)
+    cb = (a.pitch_radius + b.pitch_radius, 0.0)
+    ta0 = gm.align_theta0(a, (0.0, 0.0), b, cb, 0.0) + offset
+    ra_, rb_ = gm.gear_radii(a), gm.gear_radii(b)
+    for i in range(steps):
+        d = i / steps * a.angular_pitch
+        pa = _points(gm.build_profile(a, (0.0, 0.0), ta0 + d, 30).segments)
+        pb = _points(gm.build_profile(b, cb, -d * za / zb, 30).segments)
+        mat_a = local_material(pa, (0.0, 0.0), 0.0, 1.0, ra_.root * 0.5)
+        mat_b = local_material(pb, cb, math.pi, 1.0, rb_.root * 0.5)
+        if any(inside(mat_b, q) for q in in_window(pa, (0.0, 0.0), 0.0, 0.9)) or                 any(inside(mat_a, q) for q in in_window(pb, cb, math.pi, 0.9)):
+            return True
+    return False
+
+
+@pytest.mark.parametrize('za, zb', [(8, 8), (10, 10), (10, 20), (10, 40), (12, 30), (14, 14), (8, 60)])
+def test_small_external_pairs_dont_collide(za, zb):
+    assert not ext_pair_collides(za, zb)
+
+
+def test_sweeps_detect_collisions():
+    """Sanity checks for the sweeps themselves."""
+    assert ext_pair_collides(14, 23, offset=ext(14).angular_pitch / 2, steps=4)
+    assert ring_pinion_collides(40, 10, trim=False)
+
+
+def test_analytic_external_check_agrees():
+    assert not gm.pair_collides(ext(10, backlash=B), ext(10, backlash=B))
+    assert not gm.pair_collides(ext(10, backlash=B), ext(40, backlash=B))
+
+
+def test_trim_reports_the_pinion_that_set_it():
+    r = ring(60, backlash=B)
+    radii = gm.gear_radii(r, (ext(20, backlash=B), ext(12, backlash=B), ext(15, backlash=B)))
+    assert radii.trim is not None and radii.trim.pinion.teeth == 12
+    assert radii.tip > r.tip_radius
+
+
+def test_pinion_tips_hitting_ring_gets_its_own_message():
+    """A real small-difference pair: 20 teeth in a 21-tooth ring can't be fixed by trimming."""
+    p = ext(20, backlash=B)
+    tight = ring(21, backlash=B)
+    trim = gm.ring_trim(tight, p)
+    assert not trim.clears and trim.limited_by == 'tip'
+    report = gm.pair_report(tight, gm.gear_radii(tight, (p,)), p)
+    assert any("tips hit the ring's teeth" in w and "can't fix" in w and 'at least 24 teeth' in w
+               for w in report.warnings)
+    # The N in the message is right: 22 and 23 still fail, 24 clears.
+    assert not gm.ring_trim(ring(22, backlash=B), p).clears
+    assert not gm.ring_trim(ring(23, backlash=B), p).clears
+    assert gm.ring_trim(ring(24, backlash=B), p).clears
+
+
+def test_tip_limited_trim_clears_in_polygon_sweep():
+    """24 teeth around a 20-tooth pinion: cleared by trimming for the pinion's tips."""
+    assert gm.ring_trim(ring(24, backlash=B), ext(20, backlash=B)).limited_by == 'tip'
+    assert not ring_pinion_collides(24, 20)
+
+
+def test_later_pinion_warns_when_ring_tips_are_too_deep():
+    r, p = ring(40, backlash=B), ext(10, backlash=B)
+    report = gm.pair_report(p, gm.gear_radii(p), r, partner_tip=r.tip_radius)
+    assert any('Edit the ring' in w and '10-tooth' in w for w in report.warnings)
+    trimmed = gm.gear_radii(r, (p,)).tip
+    report2 = gm.pair_report(p, gm.gear_radii(p), r, partner_tip=trimmed)
+    assert not any('Edit the ring' in w for w in report2.warnings)
+
+
+# --- planetary sets ------------------------------------------------------------
+
+def plan(zs, zp, n, k=1.0, backlash=B):
+    return gm.check_planetary(2.0, DEG20, k, backlash, zs, zp, n)
+
+
+def test_planetary_passing_set():
+    res = plan(30, 15, 3)
+    assert res.ok and res.good
+    assert res.ring.teeth == 60
+    assert res.ratio == pytest.approx(3.0)
+    assert res.orbit_radius == pytest.approx(45.0)
+
+
+def test_planetary_borderline_set_passes_with_warning():
+    res = plan(20, 10, 3)
+    assert res.ok and not res.good
+    assert any('contact ratio' in w for w in res.warnings)
+
+
+def test_planetary_blocks_below_contact_ratio_1():
+    res = plan(16, 8, 3)
+    assert res.rules[0].ok and res.rules[1].ok
+    assert not res.ok
+    assert not res.rules[2].ok and 'contact ratio 0.9' in res.rules[2].detail
+    assert not res.rules[3].ok
+
+
+def test_planetary_spacing_rule_fails():
+    res = plan(18, 11, 3)
+    assert not res.ok
+    assert not res.rules[0].ok and 'not a whole number' in res.rules[0].detail
+
+
+def test_planetary_planets_collide_with_each_other():
+    res = plan(10, 20, 6)
+    assert res.rules[0].ok and not res.rules[1].ok
+
+
+def test_planetary_spacing_rule_matches_mesh_alignment():
+    """With the spacing rule met, planets aligned to the sun all mesh with a ring aligned to one planet."""
+    for zs, zp, n, expect in ((20, 10, 3, True), (24, 18, 4, True), (18, 11, 3, False)):
+        sun, pl, rg = gm.planetary_params(2.0, DEG20, 1.0, 0.0, zs, zp)
+        orbit = sun.pitch_radius + pl.pitch_radius
+        centers = [(orbit * math.cos(2 * math.pi * i / n), orbit * math.sin(2 * math.pi * i / n)) for i in range(n)]
+        t_pl = [gm.align_theta0(pl, c, sun, (0, 0), 0.0) for c in centers]
+        t_ring = gm.align_theta0(rg, (0, 0), pl, centers[0], t_pl[0])
+        meshed = all(gm.mesh_error(rg, (0, 0), t_ring, pl, c, t) < 1e-9 for c, t in zip(centers, t_pl))
+        assert meshed == expect == gm.spacing_ok(zs, zp, n)
+
+
+@pytest.mark.parametrize('zs, zp, n', [(18, 11, 3), (20, 10, 3), (10, 20, 6)])
+def test_planetary_suggestions_are_valid(zs, zp, n):
+    suggestions = gm.suggest_planetary(2.0, DEG20, 1.0, B, zs, zp, n)
+    assert suggestions
+    for s_zs, s_zp in suggestions:
+        assert plan(s_zs, s_zp, n).good
+
+
+# --- validation ---------------------------------------------------------------
 
 def test_check_params():
     assert gm.check_params(ext(5)).errors
     assert gm.check_params(gm.GearParams(0, 20, DEG20)).errors
-    assert gm.check_params(ext(16)).warnings  # undercut at 20°
-    assert not gm.check_params(ext(17)).warnings
-    assert not gm.check_params(ring(10)).errors
-
-
-def test_undercut_threshold():
-    assert gm.undercut_min_teeth(DEG20) == 17
+    assert gm.check_params(ext(16)).warnings
+    assert not gm.check_params(ring(60)).errors
 
 
 def test_check_mesh_errors_and_warnings():
@@ -277,8 +586,6 @@ def test_check_mesh_errors_and_warnings():
     assert gm.check_mesh(a, (0, 0), ext(20), (0, 0), 20).errors
     not_tangent = gm.check_mesh(a, (0, 0), ext(20), (41, 0), 20)
     assert not not_tangent.errors and not_tangent.warnings
-    close_ring = gm.check_mesh(a, (0, 0), ring(28), (8, 0), 28)
-    assert not close_ring.errors and any('12' in w for w in close_ring.warnings)
     resized = gm.check_mesh(a, (0, 0), ext(20), (40, 0), 21)
     assert resized.warnings
 
@@ -288,44 +595,47 @@ def test_check_sizing():
     assert not gm.check_sizing(43.0, ext(22), resize=True).warnings
 
 
+# --- metadata -----------------------------------------------------------------
+
 def test_attribute_roundtrip():
-    params = gm.GearParams(2.5, 31, math.radians(14.5), 0.1, gm.INTERNAL)
+    params = gm.GearParams(2.5, 31, math.radians(14.5), 0.1, gm.INTERNAL, 0.8)
     record = gm.GearRecord(params, 0.42, 'abc', rotation_offset=0.1, resize=False, reference_circles=True,
-                           mesh_with='xyz')
+                           mesh_with='xyz', tip_radius=37.9)
     parsed = gm.from_attribute(gm.to_attribute(record))
     assert parsed is not None
     p2 = parsed.params
-    assert p2.module == 2.5 and p2.teeth == 31 and p2.internal and p2.backlash == 0.1
+    assert p2.module == 2.5 and p2.teeth == 31 and p2.internal and p2.backlash == 0.1 and p2.height_factor == 0.8
     assert p2.pressure_angle == pytest.approx(params.pressure_angle)
     assert (parsed.theta0, parsed.gear_id, parsed.rotation_offset) == (0.42, 'abc', 0.1)
     assert (parsed.resize, parsed.reference_circles, parsed.mesh_with) == (False, True, 'xyz')
+    assert parsed.drawn_tip == 37.9
     assert parsed.editable
     assert gm.from_attribute('not json') is None
     assert gm.from_attribute('{"version": 1}') is None
     assert gm.from_attribute('[1, 2]') is None
 
 
+def test_missing_factor_defaults_to_standard():
+    v2 = ('{"version": 2, "id": "a", "type": "internal", "module_mm": 2.0, "pressure_angle_deg": 20.0, '
+          '"teeth": 40, "theta0_rad": 0.0, "backlash_mm": 0.05}')
+    rec = gm.from_attribute(v2)
+    assert rec.params.height_factor == 1.0
+    assert rec.drawn_tip == pytest.approx(gm.gear_radii(rec.params).tip)  # no stored tip: nominal, no trim
+
+
 def test_version1_attribute_still_reads():
     v1 = ('{"version": 1, "type": "external", "module_mm": 2.0, "pressure_angle_deg": 20.0, '
           '"teeth": 22, "theta0_rad": 0.0, "backlash_mm": 0.0}')
     rec = gm.from_attribute(v1)
-    assert rec is not None and rec.params.teeth == 22 and not rec.editable
+    assert rec is not None and rec.params.teeth == 22 and not rec.editable and rec.params.height_factor == 1.0
 
 
-@pytest.mark.parametrize('internal', [False, True])
-def test_mesh_error(internal):
-    if internal:
-        a, b = ring(60), ext(20)
-        ca, cb = (0.0, 0.0), (a.pitch_radius - b.pitch_radius, 0.0)
-    else:
-        a, b = ext(22), ext(15)
-        ca, cb = (0.0, 0.0), (a.pitch_radius + b.pitch_radius, 0.0)
-    tb = 0.3
-    ta = gm.align_theta0(a, ca, b, cb, tb)
-    assert gm.mesh_error(a, ca, ta, b, cb, tb) == pytest.approx(0, abs=1e-9)
-    assert gm.mesh_error(b, cb, tb, a, ca, ta) == pytest.approx(0, abs=1e-9)
-    assert gm.mesh_error(a, ca, ta + a.angular_pitch / 2, b, cb, tb) == pytest.approx(0.5)
-    assert gm.mesh_error(a, ca, ta + a.angular_pitch, b, cb, tb) == pytest.approx(0, abs=1e-9)
+def test_plan_attribute_roundtrip():
+    plan_rec = gm.PlanRecord('s1', 'ring', 0, 20, 10, 3, 2.0, DEG20, 0.8)
+    parsed = gm.from_plan_attribute(gm.to_plan_attribute(plan_rec))
+    assert parsed == plan_rec
+    assert parsed.teeth == 40 and parsed.gear_type == gm.INTERNAL
+    assert gm.from_plan_attribute('{"role": "moon"}') is None
 
 
 def test_to_svg_writes_file():

@@ -74,6 +74,12 @@ def run(context):
                                                   adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
     check('extrude created', ext is not None and ext.healthState == adsk.fusion.FeatureHealthStates.HealthyFeatureHealthState)
 
+    # A user's own line attached to a tooth point must survive edits of that gear.
+    tip_arc = next(e for e in ra.entities if e.objectType.endswith('SketchArc'))
+    p0 = tip_arc.startSketchPoint
+    user_line = sketch.sketchCurves.sketchLines.addByTwoPoints(
+        p0, adsk.core.Point3D.create(p0.geometry.x * 1.5, p0.geometry.y * 1.5, 0))
+
     curves_before = sketch.sketchCurves.count
     # Same geometry, different backlash: B stays aligned (backlash doesn't change phase).
     pa2 = gm.GearParams(2.0, 22, alpha, 0.15)
@@ -82,6 +88,7 @@ def run(context):
     check('old curves replaced, not added', sketch.sketchCurves.count == curves_before,
           f'{curves_before} -> {sketch.sketchCurves.count}')
     check('same id kept', dr.read_gear(a).gear_id == rec_a.gear_id)
+    check("user's attached line survives the edit", user_line.isValid)
     check('no dependent warning when still aligned',
           not any('no longer lines up' in w for w in re1.warnings), str(re1.warnings))
     check('A record updated', abs(dr.read_gear(a).params.backlash - 0.15) < 1e-12)

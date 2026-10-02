@@ -5,22 +5,37 @@ See SPEC.md for the formulas and conventions used here.
 """
 from __future__ import annotations
 
+import bisect
+import functools
 import json
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional, Union
 
 Point = tuple[float, float]
 
 STANDARD_MODULES_MM: list[float] = [0.5, 0.8, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0]
 PRESSURE_ANGLES_DEG: list[float] = [14.5, 20.0, 25.0]
+HEIGHT_FACTORS: dict[str, float] = {'Standard': 1.0, 'Stub': 0.8}
 MIN_TEETH = 6
 MAX_TEETH = 400
 TANGENCY_TOL_MM = 0.001
-ATTR_VERSION = 2
+ATTR_VERSION = 3
+PLAN_VERSION = 1
 
 EXTERNAL = 'external'
 INTERNAL = 'internal'
+
+CUTTER_TIP_RADIUS = 0.38    # × module: ISO 53 profile A basic rack
+MIN_TOP_LAND = 0.2          # × module: narrowest allowed tooth tip
+FACTOR_FLOOR = 0.6          # lowest factor allowed without a partner to check against
+FACTOR_SCAN_MIN = 0.3
+FACTOR_CAP = 2.0
+CONTACT_RATIO_GOOD = 1.2
+CONTACT_RATIO_MIN = 1.0     # below this a pair can't run smoothly at all
+TRIM_MARGIN = 0.01          # × module: minimum clearance a ring trim leaves
+PLANET_GAP = 0.25           # × module: minimum gap between neighbouring planets' tips
+ANGLE_TOL = 1e-9            # radians: conjugate flank contact counts as touching, not colliding
 
 
 # ---------------------------------------------------------------------------
@@ -34,6 +49,7 @@ class GearParams:
     pressure_angle: float  # radians
     backlash: float = 0.0  # total per mesh, mm
     gear_type: str = EXTERNAL
+    height_factor: float = 1.0
 
     @property
     def internal(self) -> bool:
@@ -52,18 +68,26 @@ class GearParams:
         return 2.0 * math.pi / self.teeth
 
     @property
+    def addendum(self) -> float:
+        return self.height_factor * self.module
+
+    @property
+    def dedendum(self) -> float:
+        return (self.height_factor + 0.25) * self.module
+
+    @property
     def tip_radius(self) -> float:
-        """Nominal tip radius (before any clamping)."""
+        """Nominal tip radius (before any clamping or trim)."""
         if self.internal:
-            return self.pitch_radius - self.module
-        return self.pitch_radius + self.module
+            return self.pitch_radius - self.addendum
+        return self.pitch_radius + self.addendum
 
     @property
     def root_radius(self) -> float:
         """Nominal root radius (before any clamping)."""
         if self.internal:
-            return self.pitch_radius + 1.25 * self.module
-        return self.pitch_radius - 1.25 * self.module
+            return self.pitch_radius + self.dedendum
+        return self.pitch_radius - self.dedendum
 
     @property
     def half_angle(self) -> float:
@@ -71,6 +95,9 @@ class GearParams:
         base = math.pi / (2.0 * self.teeth)
         correction = self.backlash / (4.0 * self.pitch_radius)
         return base + correction if self.internal else base - correction
+
+    def with_factor(self, k: float) -> 'GearParams':
+        return replace(self, height_factor=k)
 
 
 def involute(phi: float) -> float:
@@ -121,9 +148,588 @@ def clamp_teeth(teeth: int) -> int:
     return max(MIN_TEETH, min(MAX_TEETH, teeth))
 
 
-def undercut_min_teeth(pressure_angle: float) -> int:
-    """Rule-of-thumb minimum tooth count without undercut, floor(2 / sin²α) (17 at 20°)."""
-    return int(2.0 / math.sin(pressure_angle) ** 2)
+def _wrap(a: float) -> float:
+    return (a + math.pi) % (2.0 * math.pi) - math.pi
+
+
+# ---------------------------------------------------------------------------
+# Generating rack cutter and the generated root (external gears)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Cutter:
+    """Basic rack cutter (ISO 53 profile A) sized for one gear. Depths are below the pitch line."""
+    depth: float            # hf: tip line depth
+    corner_radius: float    # ρc
+    half_width: float       # w: half tooth width at the pitch line
+    corner_x: float         # x of the corner circle's center, from the cutter tooth's centerline
+    corner_depth: float     # depth of the corner circle's center
+    straight_depth: float   # hs: depth where the straight flank ends
+    valid: bool             # False if the cutter tooth comes to a point above its tip line
+
+
+def cutter(params: GearParams) -> Cutter:
+    m, a = params.module, params.pressure_angle
+    hf = params.dedendum
+    w = math.pi * m / 4.0 + params.backlash / 4.0
+    tip_half = w - hf * math.tan(a)
+    if tip_half <= 0.0:
+        return Cutter(hf, 0.0, w, 0.0, hf, hf, False)
+    rho = min(CUTTER_TIP_RADIUS * m, tip_half / (1.0 / math.cos(a) - math.tan(a)))
+    d_c = hf - rho
+    x_c = max(0.0, w - d_c * math.tan(a) - rho / math.cos(a))
+    return Cutter(hf, rho, w, x_c, d_c, hf - rho * (1.0 - math.sin(a)), True)
+
+
+def undercut_threshold(params: GearParams) -> float:
+    """Teeth below this are undercut by the cutter: 2·hs / (m·sin²α)."""
+    return 2.0 * cutter(params).straight_depth / (params.module * math.sin(params.pressure_angle) ** 2)
+
+
+def undercut_min_teeth(params: GearParams) -> int:
+    """Whole-tooth form of the undercut threshold (17 at 20°, k = 1)."""
+    return int(undercut_threshold(params))
+
+
+@dataclass(frozen=True)
+class RootShape:
+    """Tooth half-angle below the involute: from the root circle up to the form radius."""
+    form: float
+    rhos: tuple            # ascending, root radius .. form radius
+    halves: tuple
+
+    def half_at(self, rho: float) -> float:
+        i = bisect.bisect_left(self.rhos, rho)
+        if i <= 0:
+            return self.halves[0]
+        if i >= len(self.rhos):
+            return self.halves[-1]
+        r0, r1 = self.rhos[i - 1], self.rhos[i]
+        h0, h1 = self.halves[i - 1], self.halves[i]
+        return h0 + (h1 - h0) * (rho - r0) / (r1 - r0) if r1 > r0 else h1
+
+
+def _gear_frame(q: Point, t: float, tau: float) -> tuple[float, float]:
+    """Rack-world point at roll angle t → (ρ, tooth half-angle) in the gear's frame.
+
+    The tooth space is centered on +y; the tooth whose flank this is sits clockwise of it.
+    """
+    c, s = math.cos(-t), math.sin(-t)
+    x, y = q[0] * c - q[1] * s, q[0] * s + q[1] * c
+    return math.hypot(x, y), math.atan2(y, x) - math.pi / 2.0 + tau / 2.0
+
+
+def _envelope_families(params: GearParams, samples: int = 240) -> tuple[float, list[list[tuple[float, float]]]]:
+    """Cutter contact curves below the involute, as (ρ, half-angle) polylines, and the lowest radius
+    the involute is still generated at.
+
+    Families: the straight flank past the involute's cusp (only when undercut), and the corner
+    circle's envelope, where the contact normal passes through the pitch point.
+    """
+    cut = cutter(params)
+    r, a, tau = params.pitch_radius, params.pressure_angle, params.angular_pitch
+    sa, ca = math.sin(a), math.cos(a)
+    w, hs, d_c, x_c, rho = cut.half_width, cut.straight_depth, cut.corner_depth, cut.corner_x, cut.corner_radius
+
+    def flank_point(depth: float) -> tuple[float, float]:
+        length = depth / (sa * ca)          # = w − r·t
+        t = (w - length) / r
+        return _gear_frame((length * ca * ca, r - length * sa * ca), t, tau)
+
+    d_cusp = r * sa * sa                     # depth where the line of action touches the base circle
+    involute_low = flank_point(min(hs, d_cusp))[0]
+    families = []
+    if hs > d_cusp:
+        families.append([flank_point(d_cusp + (hs - d_cusp) * i / samples) for i in range(samples + 1)])
+    corner = []
+    x_top = 3.0 * d_c / math.tan(a)
+    for i in range(samples + 1):
+        x = x_top * (1.0 - i / samples)      # = x_c − r·t
+        t = (x_c - x) / r
+        n = math.hypot(x, d_c)
+        q = (x + rho * x / n, r - d_c - rho * d_c / n)
+        corner.append(_gear_frame(q, t, tau))
+    families.append(corner)
+    return involute_low, families
+
+
+def _family_min(families: list[list[tuple[float, float]]], rho: float) -> Optional[float]:
+    best = None
+    for fam in families:
+        for (r0, h0), (r1, h1) in zip(fam, fam[1:]):
+            lo, hi = (r0, r1) if r0 <= r1 else (r1, r0)
+            if lo <= rho <= hi:
+                h = h0 if hi == lo else h0 + (h1 - h0) * (rho - r0) / (r1 - r0)
+                if best is None or h < best:
+                    best = h
+    return best
+
+
+@functools.lru_cache(maxsize=1024)
+def root_shape(params: GearParams, table_size: int = 64) -> RootShape:
+    """The generated root of an external gear: the region the rack cutter leaves below the involute."""
+    involute_low, families = _envelope_families(params)
+    rf = params.root_radius
+
+    # Form radius: the highest crossing of a cutter curve with the involute, or where the
+    # involute stops being generated.
+    form = involute_low
+    for fam in families:
+        prev = None
+        for rho, h in fam:
+            g = h - flank_angle(params, rho) if rho >= involute_low else None
+            if prev is not None and g is not None and prev[1] is not None and (prev[1] < 0) != (g < 0):
+                r0, g0 = prev
+                form = max(form, r0 + (rho - r0) * g0 / (g0 - g))
+            prev = (rho, g)
+
+    # The corner envelope's lowest point is on the root circle; use it where sampling misses.
+    bottom = min((pt for fam in families for pt in fam), key=lambda pt: pt[0])
+    rhos, halves = [], []
+    for i in range(table_size + 1):
+        rho = rf + (form - rf) * (i / table_size) ** 2
+        h = _family_min(families, rho)
+        if rho >= involute_low:
+            inv = flank_angle(params, rho)
+            h = inv if h is None else min(h, inv)
+        if h is None:
+            h = bottom[1] if rho <= bottom[0] + 1e-9 else (halves[-1] if halves else bottom[1])
+        rhos.append(rho)
+        halves.append(h)
+    halves[-1] = flank_angle(params, form)
+    return RootShape(form, tuple(rhos), tuple(halves))
+
+
+# ---------------------------------------------------------------------------
+# Drawn radii: one calculation for tip, root and form
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Trim:
+    """What one pinion requires of a ring's tip."""
+    pinion: GearParams
+    required_tip: float     # smallest ring tip radius that clears (0 if no trim is needed)
+    limited_by: str         # 'root' (ring tip into pinion root), 'tip' (pinion tip into ring), or ''
+    clears: bool            # False if no trim can clear (it would remove the whole addendum)
+
+
+@dataclass(frozen=True)
+class Radii:
+    tip: float
+    root: float
+    form: float
+    untrimmed_tip: float
+    warnings: tuple = ()
+    trim: Optional[Trim] = None       # the pinion that set a ring's trim, if trimmed
+    failed: tuple = ()                # trims that can't clear
+
+    @property
+    def trimmed_by(self) -> float:
+        return self.tip - self.untrimmed_tip
+
+
+def tooth_half_angle(params: GearParams, rho: float) -> float:
+    """Half-angle of an external gear's tooth at ρ, as drawn (involute above the form radius)."""
+    rs = root_shape(params)
+    return rs.half_at(rho) if rho < rs.form else flank_angle(params, rho)
+
+
+@functools.lru_cache(maxsize=1024)
+def gear_radii(params: GearParams, pinions: tuple = ()) -> Radii:
+    """Tip, root and form radii as drawn. `pinions` (rings only) are the external gears to trim against."""
+    warnings = []
+    if params.internal:
+        tip = params.tip_radius
+        if tip < params.base_radius:
+            tip = params.base_radius
+            warnings.append('Internal tips clamped to the base circle (teeth slightly short).')
+        root = params.root_radius
+        pointed = radius_where_pointed(params)
+        if pointed < root:
+            root = pointed
+            warnings.append('Tooth spaces come to a point; root clamped.')
+        untrimmed = tip
+        trims = [ring_trim(params, p) for p in pinions]
+        ok = [t for t in trims if t.clears]
+        worst = max(ok, key=lambda t: t.required_tip) if ok else None
+        if worst is not None and worst.required_tip > tip:
+            tip = worst.required_tip
+        else:
+            worst = None
+        failed = tuple(t for t in trims if not t.clears)
+        return Radii(tip, root, tip, untrimmed, tuple(warnings), worst, failed)
+
+    tip = params.tip_radius
+    pointed = radius_where_pointed(params)
+    if pointed < tip:
+        tip = pointed
+        warnings.append('Teeth come to a point; tip clamped.')
+    form = root_shape(params).form
+    return Radii(tip, params.root_radius, form, tip, tuple(warnings))
+
+
+# ---------------------------------------------------------------------------
+# Material tests and the ring tip trim
+# ---------------------------------------------------------------------------
+
+def _nearest_center(angle: float, first: float, step: float) -> float:
+    return first + round((angle - first) / step) * step
+
+
+def _inside_external(params: GearParams, radii: Radii, theta0: float, rho: float, angle: float) -> bool:
+    """Is a point (polar, gear frame) inside an external gear's material?"""
+    if rho <= radii.root - 1e-9:
+        return True
+    if rho >= radii.tip:
+        return False
+    rel = angle - _nearest_center(angle, theta0, params.angular_pitch)
+    return abs(rel) < tooth_half_angle(params, rho) - ANGLE_TOL
+
+
+def _inside_ring_tooth_span(params: GearParams, theta0: float, rho: float, angle: float) -> bool:
+    """Is a point between a ring tooth's flanks at this radius (ignoring where the tip is)?"""
+    if rho < params.base_radius:
+        return False
+    rel = angle - _nearest_center(angle, theta0, params.angular_pitch)
+    return abs(rel) < params.angular_pitch / 2.0 - flank_angle(params, rho) - ANGLE_TOL
+
+
+def _external_boundary(params: GearParams, radii: Radii) -> list[tuple[Point, str]]:
+    """Boundary points of one tooth (centered on angle 0) and its root, in the gear's frame.
+
+    Kind 'work' = involute and tip; 'root' = generated root and root circle.
+    """
+    pts: list[tuple[Point, str]] = []
+    for rho in flank_radii(radii.form, radii.tip, 12):
+        h = flank_angle(params, rho)
+        pts += [((rho * math.cos(h), rho * math.sin(h)), 'work'), ((rho * math.cos(-h), rho * math.sin(-h)), 'work')]
+    ht = flank_angle(params, radii.tip)
+    for i in range(5):
+        ang = -ht + 2 * ht * i / 4
+        pts.append(((radii.tip * math.cos(ang), radii.tip * math.sin(ang)), 'work'))
+    for (x, y) in _root_polyline(params):
+        pts += [((x, y), 'root'), ((x, -y), 'root')]
+    return pts
+
+
+@functools.lru_cache(maxsize=1024)
+def _root_polyline(params: GearParams, below: float = 0.0) -> tuple:
+    """One side of an external tooth's non-working surface, tooth on angle 0: the generated root
+    from `below` under the form radius down to the root circle, then the root circle out to the
+    middle of the space."""
+    rs = root_shape(params)
+    pts = [(rho * math.cos(h), rho * math.sin(h)) for rho, h in zip(reversed(rs.rhos), reversed(rs.halves))
+           if rho <= rs.form - below or rho == rs.rhos[0]]
+    h_root = rs.halves[0]
+    for i in range(1, 9):
+        ang = h_root + (params.angular_pitch / 2 - h_root) * i / 8
+        pts.append((params.root_radius * math.cos(ang), params.root_radius * math.sin(ang)))
+    return tuple(pts)
+
+
+def _near_root(params: GearParams, form: float, rho: float, rel: float, margin: float) -> bool:
+    """Is a point (tooth-relative polar) within `margin` of the tooth's non-working surface?
+
+    The surface within one margin of the form radius is left out: there the root meets the
+    working involute, whose clearance is set by backlash, not by the trim.
+    """
+    if rho > form:
+        return False
+    px, py = rho * math.cos(abs(rel)), rho * math.sin(abs(rel))
+    poly = _root_polyline(params, round(margin, 9))
+    m2 = margin * margin
+    for (x0, y0), (x1, y1) in zip(poly, poly[1:]):
+        dx, dy = x1 - x0, y1 - y0
+        L = dx * dx + dy * dy
+        t = 0.0 if L == 0 else max(0.0, min(1.0, ((px - x0) * dx + (py - y0) * dy) / L))
+        ex, ey = x0 + t * dx - px, y0 + t * dy - py
+        if ex * ex + ey * ey < m2:
+            return True
+    return False
+
+
+def trim_margin(ring: GearParams, pinion: GearParams) -> float:
+    backlash = (ring.backlash + pinion.backlash) / 2.0
+    return max(TRIM_MARGIN * ring.module, backlash * math.cos(ring.pressure_angle) / 4.0)
+
+
+class _Mesh:
+    """A ring and pinion at standard spacing: ring at the origin, pinion center on +y, phases in pinion teeth."""
+
+    def __init__(self, ring: GearParams, pinion: GearParams):
+        self.ring, self.pinion = ring, pinion
+        self.a = ring.pitch_radius - pinion.pitch_radius
+        self.theta0_r = align_theta0(ring, (0.0, 0.0), pinion, (0.0, self.a), 0.0)
+        self.pin_radii = gear_radii(pinion)
+
+    def angles(self, s: float) -> tuple[float, float]:
+        phi_p = s * self.pinion.angular_pitch
+        return phi_p, phi_p * self.pinion.teeth / self.ring.teeth
+
+    def ring_tip_points(self, tip: float) -> list[tuple[float, float]]:
+        """Ring tooth tip arc and the flank just below it, tooth on angle 0, as (ρ, angle) in the ring frame."""
+        ring = self.ring
+        ht = ring.angular_pitch / 2.0 - flank_angle(ring, tip)
+        pts = [(tip, -ht + 2 * ht * i / 8) for i in range(9)]
+        for rho in (tip + 0.05 * ring.module, tip + 0.15 * ring.module):
+            if rho < ring.pitch_radius:
+                h = ring.angular_pitch / 2.0 - flank_angle(ring, rho)
+                pts += [(rho, h), (rho, -h)]
+        return pts
+
+    def tip_clears(self, tip: float, margin: float, phase_list) -> bool:
+        """Do the ring's tips (at this radius) stay out of the pinion and its root margin at these phases?"""
+        ring, pin, pr = self.ring, self.pinion, self.pin_radii
+        pts = self.ring_tip_points(tip)
+        # Only ring teeth that can reach the pinion: within its tip circle as seen from the ring center.
+        reach = (pr.tip + ring.module) / self.a
+        window = math.asin(reach) + 0.05 if reach < 1.0 else math.pi / 2.0
+        for s in phase_list:
+            phi_p, phi_r = self.angles(s)
+            for j in range(ring.teeth):
+                rot = self.theta0_r + j * ring.angular_pitch + phi_r
+                if abs(_wrap(rot - math.pi / 2.0)) > window:
+                    continue
+                for rho_r, ang in pts:
+                    wx, wy = rho_r * math.cos(rot + ang), rho_r * math.sin(rot + ang)
+                    rho = math.hypot(wx, wy - self.a)
+                    pa = math.atan2(wy - self.a, wx) - phi_p
+                    rel = pa - _nearest_center(pa, 0.0, pin.angular_pitch)
+                    if rho <= pr.root - 1e-9:
+                        return False
+                    if rho < pr.tip and abs(rel) < tooth_half_angle(pin, rho) - ANGLE_TOL:
+                        return False
+                    if margin > 0 and _near_root(pin, pr.form, rho, rel, margin):
+                        return False
+        return True
+
+    def pinion_tip_demand(self, phases: int) -> float:
+        """Largest ring radius at which the pinion's working surface enters a ring tooth's span.
+
+        The ring's tip must be above this, or the pinion's tips hit the ring's teeth.
+        """
+        ring, pin = self.ring, self.pinion
+        pts = [p for p, kind in _external_boundary(pin, self.pin_radii) if kind == 'work']
+        need = 0.0
+        for i in range(phases):
+            phi_p, phi_r = self.angles(i / phases)
+            for j in range(pin.teeth):
+                rot = phi_p + j * pin.angular_pitch
+                if abs(_wrap(rot - math.pi / 2.0)) > math.radians(110):
+                    continue
+                c, sn = math.cos(rot), math.sin(rot)
+                for x, y in pts:
+                    wx, wy = x * c - y * sn, self.a + x * sn + y * c
+                    rho = math.hypot(wx, wy)
+                    if rho <= need or rho < ring.base_radius:
+                        continue
+                    ang = math.atan2(wy, wx) - phi_r
+                    rel = ang - _nearest_center(ang, self.theta0_r, ring.angular_pitch)
+                    if abs(rel) < ring.angular_pitch / 2.0 - flank_angle(ring, rho) - ANGLE_TOL:
+                        need = rho
+        return need
+
+
+@functools.lru_cache(maxsize=512)
+def ring_trim(ring: GearParams, pinion: GearParams, phases: int = 40) -> Trim:
+    """Smallest ring tip radius that clears this pinion over a full tooth of rotation (see SPEC)."""
+    mesh = _Mesh(ring, pinion)
+    margin = trim_margin(ring, pinion)
+    base_tip = gear_radii(ring).tip
+    top = ring.pitch_radius - 1e-6
+
+    tip_need = mesh.pinion_tip_demand(phases)
+    if tip_need > 0:
+        tip_need += margin
+    if tip_need >= top:
+        return Trim(pinion, tip_need, 'tip', False)
+
+    # Raise the tip phase by phase: each phase only needs a bisection if it beats the current bound.
+    start = max(base_tip, tip_need)
+    bound = start
+    for i in range(phases):
+        phase_i = (i / phases,)
+        if mesh.tip_clears(bound, margin, phase_i):
+            continue
+        if not mesh.tip_clears(top, margin, phase_i):
+            return Trim(pinion, top, 'root', False)
+        lo, hi = bound, top
+        for _ in range(16):
+            mid = (lo + hi) / 2.0
+            if mesh.tip_clears(mid, margin, phase_i):
+                hi = mid
+            else:
+                lo = mid
+        bound = hi
+    if bound > start:
+        return Trim(pinion, bound, 'root', True)
+    need, kind = (tip_need, 'tip') if tip_need > base_tip else (0.0, '')
+    return Trim(pinion, need, kind, True)
+
+
+def pair_collides(a: GearParams, b: GearParams, phases: int = 48) -> bool:
+    """Do two external gears, as drawn and meshed at standard spacing, collide over a full tooth?"""
+    ra_, rb_ = gear_radii(a), gear_radii(b)
+    dist = a.pitch_radius + b.pitch_radius
+    tb = 0.0
+    ta = align_theta0(a, (0.0, 0.0), b, (dist, 0.0), tb)
+    pts_a = _external_boundary(a, ra_)
+    pts_b = _external_boundary(b, rb_)
+    for i in range(phases):
+        phi_a = i / phases * a.angular_pitch
+        phi_b = -phi_a * a.teeth / b.teeth
+        for pts, own, own_t, own_c, other, other_r, other_t, other_c in (
+                (pts_a, a, ta + phi_a, (0.0, 0.0), b, rb_, tb + phi_b, (dist, 0.0)),
+                (pts_b, b, tb + phi_b, (dist, 0.0), a, ra_, ta + phi_a, (0.0, 0.0))):
+            facing = math.atan2(other_c[1] - own_c[1], other_c[0] - own_c[0])
+            for j in range(own.teeth):
+                rot = own_t + j * own.angular_pitch
+                if abs(_wrap(rot - facing)) > math.radians(100):
+                    continue
+                c, s = math.cos(rot), math.sin(rot)
+                for (x, y), _ in pts:
+                    wx, wy = own_c[0] + x * c - y * s, own_c[1] + x * s + y * c
+                    rho = math.hypot(wx - other_c[0], wy - other_c[1])
+                    ang = math.atan2(wy - other_c[1], wx - other_c[0])
+                    if _inside_external(other, other_r, other_t, rho, ang):
+                        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Contact ratio and the tooth height factor's range
+# ---------------------------------------------------------------------------
+
+def contact_ratio(a: GearParams, a_radii: Radii, b: GearParams, b_radii: Radii,
+                  center_distance: Optional[float] = None) -> float:
+    """Average number of tooth pairs in contact, from the drawn profiles (see SPEC)."""
+    if center_distance is None:
+        center_distance = expected_center_distance(a, b)
+    pb = math.pi * a.module * math.cos(a.pressure_angle)
+
+    def s(radius: float, rb: float) -> float:
+        return math.sqrt(max(radius * radius - rb * rb, 0.0))
+
+    if a.internal or b.internal:
+        ring, rr, pin, pr = (a, a_radii, b, b_radii) if a.internal else (b, b_radii, a, a_radii)
+        d = math.sqrt(max(center_distance ** 2 - (ring.base_radius - pin.base_radius) ** 2, 0.0))
+        ring_lo, ring_hi = s(rr.tip, ring.base_radius) - d, s(rr.root, ring.base_radius) - d
+        pin_lo, pin_hi = s(pr.form, pin.base_radius), s(pr.tip, pin.base_radius)
+    else:
+        d = math.sqrt(max(center_distance ** 2 - (a.base_radius + b.base_radius) ** 2, 0.0))
+        ring_lo, ring_hi = d - s(b_radii.tip, b.base_radius), d - s(b_radii.form, b.base_radius)
+        pin_lo, pin_hi = s(a_radii.form, a.base_radius), s(a_radii.tip, a.base_radius)
+    return max(0.0, min(ring_hi, pin_hi) - max(ring_lo, pin_lo)) / pb
+
+
+def pair_radii(a: GearParams, b: GearParams) -> tuple[Radii, Radii]:
+    """Drawn radii for a meshing pair, with a ring trimmed against its pinion."""
+    if a.internal:
+        return gear_radii(a, (b,)), gear_radii(b)
+    if b.internal:
+        return gear_radii(a), gear_radii(b, (a,))
+    return gear_radii(a), gear_radii(b)
+
+
+def pair_contact_ratio(a: GearParams, b: GearParams, phases: int = 40) -> float:
+    """Contact ratio of a pair as drawn. Fewer phases give a faster, slightly coarser ring trim."""
+    if phases == 40 or not (a.internal or b.internal):
+        ra_, rb_ = pair_radii(a, b)
+        return contact_ratio(a, ra_, b, rb_)
+    ring, pin = (a, b) if a.internal else (b, a)
+    base = gear_radii(ring)
+    trim = ring_trim(ring, pin, phases)
+    tip = max(base.tip, trim.required_tip) if trim.clears else base.tip
+    return contact_ratio(ring, replace(base, tip=tip, form=tip), pin, gear_radii(pin))
+
+
+def top_land(params: GearParams) -> float:
+    """Width of the tooth tip at the nominal tip (clamps and trim excluded)."""
+    if params.internal:
+        tip = max(params.tip_radius, params.base_radius)
+        return 2.0 * tip * (params.angular_pitch / 2.0 - flank_angle(params, tip))
+    tip = params.tip_radius
+    return 2.0 * tip * flank_angle(params, tip)
+
+
+def factor_geometry_ok(params: GearParams) -> bool:
+    """Is the tooth valid at its factor: wide enough tip, and (external) working involute left?"""
+    if top_land(params) < MIN_TOP_LAND * params.module - 1e-12:
+        return False
+    if not params.internal:
+        if not cutter(params).valid or params.root_radius <= 0:
+            return False
+        if root_shape(params).form >= params.tip_radius:
+            return False
+    return True
+
+
+def _boundary(lo: float, hi: float, ok_at, iterations: int = 14) -> float:
+    """Bisect between lo (ok) and hi (not ok)."""
+    for _ in range(iterations):
+        mid = (lo + hi) / 2.0
+        if ok_at(mid):
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+@functools.lru_cache(maxsize=1024)
+def factor_max(params: GearParams) -> float:
+    """Largest tooth height factor for this gear (see SPEC)."""
+    def ok(k: float) -> bool:
+        return factor_geometry_ok(params.with_factor(k))
+    k, step = FACTOR_SCAN_MIN, 0.05
+    if not ok(k):
+        return FACTOR_SCAN_MIN
+    while k + step <= FACTOR_CAP + 1e-9:
+        if not ok(k + step):
+            return math.floor(_boundary(k, k + step, ok) * 1e4) / 1e4
+        k += step
+    return FACTOR_CAP
+
+
+def _pair_key(a: GearParams, b: GearParams) -> tuple:
+    return a.with_factor(1.0), b.with_factor(1.0)
+
+
+@functools.lru_cache(maxsize=512)
+def _factor_min_pair(a: GearParams, b: GearParams) -> Optional[float]:
+    k_hi = min(factor_max(a), factor_max(b))
+
+    def ok(k: float) -> bool:
+        return pair_contact_ratio(a.with_factor(k), b.with_factor(k), phases=20) >= CONTACT_RATIO_GOOD
+
+    if not ok(k_hi):
+        return None
+    k = k_hi
+    while k - 0.1 >= FACTOR_SCAN_MIN:
+        if not ok(k - 0.1):
+            # boundary between k - 0.1 (not ok) and k (ok)
+            lo, hi = k - 0.1, k
+            for _ in range(7):
+                mid = (lo + hi) / 2.0
+                if ok(mid):
+                    hi = mid
+                else:
+                    lo = mid
+            return round(hi, 3)
+        k -= 0.1
+    return FACTOR_SCAN_MIN
+
+
+def factor_min_pair(a: GearParams, b: GearParams) -> Optional[float]:
+    """Smallest shared factor at which the pair's contact ratio reaches 1.2, or None if none does."""
+    return _factor_min_pair(*_pair_key(a, b))
+
+
+def factor_range(params: GearParams, partner: Optional[GearParams] = None) -> tuple[Optional[float], float]:
+    """(minimum, maximum) valid tooth height factor. Minimum is None when no factor works for the pair."""
+    if partner is None:
+        return FACTOR_FLOOR, factor_max(params.with_factor(1.0))
+    hi = min(factor_max(params.with_factor(1.0)), factor_max(partner.with_factor(1.0)))
+    return factor_min_pair(params, partner), hi
 
 
 # ---------------------------------------------------------------------------
@@ -184,9 +790,16 @@ class Profile:
     center: Point
     theta0: float
     segments: list[Segment]
-    tip_radius: float   # as drawn (after clamping)
-    root_radius: float  # as drawn (after clamping)
+    radii: Radii
     warnings: list[str] = field(default_factory=list)
+
+    @property
+    def tip_radius(self) -> float:
+        return self.radii.tip
+
+    @property
+    def root_radius(self) -> float:
+        return self.radii.root
 
 
 def _polar(center: Point, rho: float, angle: float) -> Point:
@@ -199,66 +812,50 @@ def flank_radii(r_start: float, r_end: float, count: int) -> list[float]:
     return [r_start + (r_end - r_start) * (i / (count - 1)) ** 2 for i in range(count)]
 
 
-def drawn_radii(params: GearParams) -> tuple[float, float, list[str]]:
-    """Tip and root radii as they'll be drawn, after clamping, plus any clamp warnings."""
-    warnings: list[str] = []
-    ra, rf = params.tip_radius, params.root_radius
-    if params.internal:
-        if ra < params.base_radius:
-            ra = params.base_radius
-            warnings.append('Internal tips clamped to the base circle (teeth slightly short).')
-        pointed = radius_where_pointed(params)
-        if pointed < rf:
-            rf = pointed
-            warnings.append('Tooth spaces come to a point; root clamped.')
-    else:
-        pointed = radius_where_pointed(params)
-        if pointed < ra:
-            ra = pointed
-            warnings.append('Teeth come to a point; tip clamped.')
-    return ra, rf, warnings
+def _root_curve(params: GearParams, count: int) -> list[tuple[float, float]]:
+    """(ρ, half-angle) points of the generated root from the root circle up to the form radius."""
+    rs = root_shape(params)
+    n = len(rs.rhos) - 1
+    idx = sorted({round(n * i / (count - 1)) for i in range(count)})
+    return [(rs.rhos[i], rs.halves[i]) for i in idx]
 
 
 def build_profile(params: GearParams, center: Point = (0.0, 0.0), theta0: float = 0.0,
-                  points_per_flank: int = 10) -> Profile:
-    """Build the closed tooth profile.
-
-    Both gear types use the same loop. Each repeated "shape" is the involute-bounded
-    region of half-angle flank_angle(ρ): an external gear's tooth, or an internal
-    gear's tooth space. Shapes run from an inner radius to an outer radius, with an
-    outer cap arc on each shape and an inner arc between neighbouring shapes.
-    """
-    ra, rf, warnings = drawn_radii(params)
-    rb = params.base_radius
+                  points_per_flank: int = 10, radii: Optional[Radii] = None) -> Profile:
+    """Build the closed tooth profile (see SPEC: "Gear geometry")."""
+    if radii is None:
+        radii = gear_radii(params)
     tau = params.angular_pitch
-    if params.internal:
-        inner, outer = ra, rf
-        first_center = theta0 + tau / 2.0
-    else:
-        inner, outer = rf, ra
-        first_center = theta0
-
-    involute_start = max(rb, inner)
-    radial_foot = inner < involute_start  # external gear with root below the base circle
-    half_inner = flank_angle(params, involute_start)
-    half_outer = flank_angle(params, outer)
-    radii = flank_radii(involute_start, outer, points_per_flank)
-
     segments: list[Segment] = []
-    for k in range(params.teeth):
-        c = first_center + k * tau
-        lead = c - half_inner
-        trail = c + half_inner
-        if radial_foot:
-            segments.append(Line(_polar(center, inner, lead), _polar(center, involute_start, lead)))
-        segments.append(Spline([_polar(center, rho, c - flank_angle(params, rho)) for rho in radii]))
-        segments.append(Arc(center, outer, c - half_outer, 2.0 * half_outer))
-        segments.append(Spline([_polar(center, rho, c + flank_angle(params, rho)) for rho in reversed(radii)]))
-        if radial_foot:
-            segments.append(Line(_polar(center, involute_start, trail), _polar(center, inner, trail)))
-        segments.append(Arc(center, inner, trail, tau - 2.0 * half_inner))
+    if params.internal:
+        inner, outer = radii.tip, radii.root
+        half_inner = flank_angle(params, inner)
+        half_outer = flank_angle(params, outer)
+        radii_list = flank_radii(inner, outer, points_per_flank)
+        for k in range(params.teeth):
+            c = theta0 + tau / 2.0 + k * tau
+            segments.append(Spline([_polar(center, rho, c - flank_angle(params, rho)) for rho in radii_list]))
+            segments.append(Arc(center, outer, c - half_outer, 2.0 * half_outer))
+            segments.append(Spline([_polar(center, rho, c + flank_angle(params, rho))
+                                    for rho in reversed(radii_list)]))
+            segments.append(Arc(center, inner, c + half_inner, tau - 2.0 * half_inner))
+        return Profile(params, center, theta0, segments, radii, list(radii.warnings))
 
-    return Profile(params, center, theta0, segments, ra, rf, warnings)
+    root = _root_curve(params, max(6, points_per_flank - 2))
+    involute = flank_radii(radii.form, radii.tip, points_per_flank)
+    half_tip = flank_angle(params, radii.tip)
+    h_root = root[0][1]
+    root_gap = tau - 2.0 * h_root
+    for k in range(params.teeth):
+        c = theta0 + k * tau
+        segments.append(Spline([_polar(center, rho, c - h) for rho, h in root]))
+        segments.append(Spline([_polar(center, rho, c - flank_angle(params, rho)) for rho in involute]))
+        segments.append(Arc(center, radii.tip, c - half_tip, 2.0 * half_tip))
+        segments.append(Spline([_polar(center, rho, c + flank_angle(params, rho)) for rho in reversed(involute)]))
+        segments.append(Spline([_polar(center, rho, c + h) for rho, h in reversed(root)]))
+        if root_gap > 1e-6 / max(radii.root, 1e-9):
+            segments.append(Arc(center, radii.root, c + h_root, root_gap))
+    return Profile(params, center, theta0, segments, radii, list(radii.warnings))
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +910,22 @@ def expected_center_distance(a: GearParams, b: GearParams) -> float:
     return a.pitch_radius + b.pitch_radius
 
 
+def mesh_error(a: GearParams, a_center: Point, a_theta0: float,
+               b: GearParams, b_center: Point, b_theta0: float) -> float:
+    """How far a pair is from the mesh condition, in teeth (0 = perfectly aligned, 0.5 = worst)."""
+    d_a, d_b = contact_directions(a.gear_type, a_center, b.gear_type, b_center)
+    p_a = phase(d_a, a_theta0, a.teeth)
+    p_b = phase(d_b, b_theta0, b.teeth)
+    if a.internal == b.internal:
+        off = p_a + p_b - 0.5
+    elif a.internal:
+        off = p_a - p_b - 0.5
+    else:
+        off = p_b - p_a - 0.5
+    off = _frac(off)
+    return min(off, 1.0 - off)
+
+
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
@@ -321,14 +934,21 @@ def expected_center_distance(a: GearParams, b: GearParams) -> float:
 class Check:
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    infos: list[str] = field(default_factory=list)
 
     def extend(self, other: 'Check') -> None:
         self.errors.extend(other.errors)
         self.warnings.extend(other.warnings)
+        self.infos.extend(other.infos)
 
     @property
     def ok(self) -> bool:
         return not self.errors
+
+
+def same_system(a: GearParams, b: GearParams) -> bool:
+    return (abs(a.module - b.module) < 1e-9 and abs(a.pressure_angle - b.pressure_angle) < 1e-9
+            and abs(a.height_factor - b.height_factor) < 1e-9)
 
 
 def check_params(params: GearParams) -> Check:
@@ -344,10 +964,18 @@ def check_params(params: GearParams) -> Check:
     if params.backlash >= math.pi * params.module / 2.0:
         check.errors.append('Backlash is larger than the tooth itself.')
         return check
-    if not params.internal and params.teeth < undercut_min_teeth(params.pressure_angle):
-        check.warnings.append(f'Under {undercut_min_teeth(params.pressure_angle)} teeth: real gears would be '
-                              'undercut. This profile isn\'t, so it may bind slightly.')
-    check.warnings.extend(drawn_radii(params)[2])
+    k_max = factor_max(params.with_factor(1.0))
+    if params.height_factor > k_max + 1e-9:
+        check.errors.append(f'Tooth height {params.height_factor:g} is above the maximum {k_max:.2f} for '
+                            f'{params.teeth} teeth (the tips would get too narrow).')
+        return check
+    if params.height_factor < FACTOR_FLOOR - 1e-9:
+        check.errors.append(f'Tooth height {params.height_factor:g} is below the minimum {FACTOR_FLOOR:g}.')
+        return check
+    if not params.internal and params.teeth < undercut_threshold(params):
+        check.warnings.append(f'Under {undercut_min_teeth(params) + 1} teeth, the root is undercut (as on a hobbed '
+                              'gear) so mating teeth clear it. Undercut teeth are thinner at the base and weaker.')
+    check.warnings.extend(gear_radii(params).warnings)
     return check
 
 
@@ -361,12 +989,14 @@ def check_sizing(circle_diameter: float, params: GearParams, resize: bool) -> Ch
 
 def check_mesh(new: GearParams, new_center: Point,
                partner: GearParams, partner_center: Point, partner_radius: float) -> Check:
-    """Validate a mesh pair. partner_radius is the partner circle's current radius."""
+    """Validate a mesh pair's compatibility and placement. partner_radius is the partner circle's radius."""
     check = Check()
     if abs(new.module - partner.module) > 1e-9:
         check.errors.append('Module doesn\'t match the mesh partner.')
     if abs(new.pressure_angle - partner.pressure_angle) > 1e-9:
         check.errors.append('Pressure angle doesn\'t match the mesh partner.')
+    if abs(new.height_factor - partner.height_factor) > 1e-9:
+        check.errors.append(f'Tooth height doesn\'t match the mesh partner ({partner.height_factor:g}).')
     if new.internal and partner.internal:
         check.errors.append('Two internal gears can\'t mesh.')
     if check.errors:
@@ -376,8 +1006,6 @@ def check_mesh(new: GearParams, new_center: Point,
         if ring.teeth <= pinion.teeth:
             check.errors.append('The ring gear needs more teeth than the pinion.')
             return check
-        if ring.teeth - pinion.teeth < 12:
-            check.warnings.append('Ring and pinion differ by under 12 teeth: possible tip interference.')
     dist = math.hypot(new_center[0] - partner_center[0], new_center[1] - partner_center[1])
     if dist < TANGENCY_TOL_MM:
         check.errors.append('Gears share a center, so there\'s no contact point to align to.')
@@ -386,6 +1014,81 @@ def check_mesh(new: GearParams, new_center: Point,
         check.warnings.append('Circles aren\'t tangent: the gears won\'t mesh at this spacing.')
     if abs(partner_radius - partner.pitch_radius) > TANGENCY_TOL_MM:
         check.warnings.append('Mesh partner was resized after it was made.')
+    return check
+
+
+def _min_ring_teeth(pinion: GearParams, ring: GearParams) -> Optional[int]:
+    """Smallest ring tooth count, from this ring's up, whose trim clears this pinion."""
+    for z in range(ring.teeth + 1, ring.teeth + 41):
+        if ring_trim(replace(ring, teeth=z), pinion).clears:
+            return z
+    return None
+
+
+def _min_pinion_teeth(ring: GearParams, pinion: GearParams, good_ratio: bool) -> Optional[int]:
+    """Smallest pinion tooth count, from this pinion's up, that clears this ring (and reaches 1.2)."""
+    for z in range(pinion.teeth + 1, ring.teeth - 1):
+        p = replace(pinion, teeth=z)
+        trim = ring_trim(ring, p)
+        if not trim.clears:
+            continue
+        if good_ratio and pair_contact_ratio(ring, p) < CONTACT_RATIO_GOOD:
+            continue
+        return z
+    return None
+
+
+def trim_failure_message(ring: GearParams, trim: Trim) -> str:
+    pinion = trim.pinion
+    if trim.limited_by == 'tip':
+        n = _min_ring_teeth(pinion, ring)
+        need = f' With this pinion the ring needs at least {n} teeth.' if n else ''
+        return f'The {pinion.teeth}-tooth pinion\'s tips hit the ring\'s teeth, and trimming the ring can\'t fix it.{need}'
+    n = _min_pinion_teeth(ring, pinion, good_ratio=False)
+    need = f' Use at least {n} pinion teeth.' if n else ''
+    return f'The ring can\'t be trimmed enough to clear the {pinion.teeth}-tooth pinion.{need}'
+
+
+def pair_report(new: GearParams, new_radii: Radii, partner: GearParams,
+                partner_tip: Optional[float] = None, planned: bool = False) -> Check:
+    """Contact ratio and interference messages for a gear and its Mesh with partner.
+
+    partner_tip is the partner's tip radius as drawn (from its attribute); None means compute it.
+    planned: the gear belongs to a planetary set, where changing one tooth count changes the
+    ring too, so the fix points to the planetary helper instead of a pinion tooth count.
+    """
+    check = Check()
+    if new.internal or partner.internal:
+        ring, pinion = (new, partner) if new.internal else (partner, new)
+        trim = ring_trim(ring, pinion)
+        if not trim.clears:
+            check.warnings.append(trim_failure_message(ring, trim))
+        if new.internal:
+            ring_radii, pin_radii = new_radii, gear_radii(pinion)
+        else:
+            base = gear_radii(ring)
+            tip = partner_tip if partner_tip else base.tip
+            ring_radii, pin_radii = replace(base, tip=tip, form=tip), new_radii
+            if trim.clears and trim.required_tip > tip + 1e-6:
+                check.warnings.append(f'The ring\'s tips hit this pinion. Edit the ring and set Mesh with to this '
+                                      f'{pinion.teeth}-tooth gear to re-trim it.')
+        cr = contact_ratio(ring, ring_radii, pinion, pin_radii)
+    else:
+        cr = contact_ratio(new, new_radii, partner, gear_radii(partner))
+    check.infos.append(f'Contact ratio {cr:.2f}')
+    if cr < CONTACT_RATIO_GOOD:
+        k_min = factor_min_pair(new, partner)
+        if k_min is not None and k_min > new.height_factor + 1e-9:
+            fix = (f'Remake the partner, then this gear, with a tooth height factor of at least {k_min:.2f}.')
+        elif planned:
+            fix = 'Run Planetary Set to see nearby tooth counts that reach 1.2.'
+        elif new.internal or partner.internal:
+            ring, pinion = (new, partner) if new.internal else (partner, new)
+            n = _min_pinion_teeth(ring, pinion, good_ratio=True)
+            fix = f'Use at least {n} pinion teeth.' if n else 'Use more pinion teeth.'
+        else:
+            fix = 'Use more teeth on one or both gears.'
+        check.warnings.append(f'Contact ratio {cr:.2f} is below {CONTACT_RATIO_GOOD}. {fix}')
     return check
 
 
@@ -403,10 +1106,15 @@ class GearRecord:
     resize: bool = True
     reference_circles: bool = False
     mesh_with: str = ''            # gear_id of the partner it was aligned to, if any
+    tip_radius: float = 0.0        # as drawn; 0 = not stored (older versions)
 
     @property
     def editable(self) -> bool:
         return bool(self.gear_id)
+
+    @property
+    def drawn_tip(self) -> float:
+        return self.tip_radius if self.tip_radius > 0 else gear_radii(self.params).tip
 
 
 def to_attribute(record: GearRecord) -> str:
@@ -417,6 +1125,7 @@ def to_attribute(record: GearRecord) -> str:
         'type': params.gear_type,
         'module_mm': params.module,
         'pressure_angle_deg': math.degrees(params.pressure_angle),
+        'tooth_height_factor': params.height_factor,
         'teeth': params.teeth,
         'theta0_rad': record.theta0,
         'backlash_mm': params.backlash,
@@ -424,11 +1133,12 @@ def to_attribute(record: GearRecord) -> str:
         'resize': record.resize,
         'reference_circles': record.reference_circles,
         'mesh_with': record.mesh_with,
+        'tip_radius_mm': record.tip_radius,
     })
 
 
 def from_attribute(value: str) -> Optional[GearRecord]:
-    """Parse a stored gear attribute (version 1 or 2), or None if it isn't valid."""
+    """Parse a stored gear attribute (versions 1–3), or None if it isn't valid."""
     try:
         data = json.loads(value)
         params = GearParams(
@@ -437,6 +1147,7 @@ def from_attribute(value: str) -> Optional[GearRecord]:
             pressure_angle=math.radians(float(data['pressure_angle_deg'])),
             backlash=float(data.get('backlash_mm', 0.0)),
             gear_type=INTERNAL if data['type'] == INTERNAL else EXTERNAL,
+            height_factor=float(data.get('tooth_height_factor', 1.0)),
         )
         return GearRecord(
             params=params,
@@ -446,25 +1157,194 @@ def from_attribute(value: str) -> Optional[GearRecord]:
             resize=bool(data.get('resize', True)),
             reference_circles=bool(data.get('reference_circles', False)),
             mesh_with=str(data.get('mesh_with', '')),
+            tip_radius=float(data.get('tip_radius_mm', 0.0)),
         )
     except (ValueError, KeyError, TypeError, AttributeError):
         return None
 
 
-def mesh_error(a: GearParams, a_center: Point, a_theta0: float,
-               b: GearParams, b_center: Point, b_theta0: float) -> float:
-    """How far a pair is from the mesh condition, in teeth (0 = perfectly aligned, 0.5 = worst)."""
-    d_a, d_b = contact_directions(a.gear_type, a_center, b.gear_type, b_center)
-    p_a = phase(d_a, a_theta0, a.teeth)
-    p_b = phase(d_b, b_theta0, b.teeth)
-    if a.internal == b.internal:
-        off = p_a + p_b - 0.5
-    elif a.internal:
-        off = p_a - p_b - 0.5
+@dataclass
+class PlanRecord:
+    """What the planetary helper stores on each circle it draws."""
+    set_id: str
+    role: str                      # 'sun', 'planet' or 'ring'
+    index: int
+    sun_teeth: int
+    planet_teeth: int
+    planets: int
+    module: float
+    pressure_angle: float          # radians
+    height_factor: float
+
+    @property
+    def ring_teeth(self) -> int:
+        return self.sun_teeth + 2 * self.planet_teeth
+
+    @property
+    def teeth(self) -> int:
+        return {'sun': self.sun_teeth, 'planet': self.planet_teeth}.get(self.role, self.ring_teeth)
+
+    @property
+    def gear_type(self) -> str:
+        return INTERNAL if self.role == 'ring' else EXTERNAL
+
+    def params(self, backlash: float) -> GearParams:
+        return GearParams(self.module, self.teeth, self.pressure_angle, backlash, self.gear_type, self.height_factor)
+
+    def planet_params(self, backlash: float) -> GearParams:
+        return GearParams(self.module, self.planet_teeth, self.pressure_angle, backlash, EXTERNAL,
+                          self.height_factor)
+
+
+def to_plan_attribute(plan: PlanRecord) -> str:
+    return json.dumps({
+        'version': PLAN_VERSION, 'set': plan.set_id, 'role': plan.role, 'index': plan.index,
+        'teeth': plan.teeth, 'sun_teeth': plan.sun_teeth, 'planet_teeth': plan.planet_teeth,
+        'ring_teeth': plan.ring_teeth, 'planets': plan.planets, 'module_mm': plan.module,
+        'pressure_angle_deg': math.degrees(plan.pressure_angle), 'tooth_height_factor': plan.height_factor,
+    })
+
+
+def from_plan_attribute(value: str) -> Optional[PlanRecord]:
+    try:
+        d = json.loads(value)
+        role = str(d['role'])
+        if role not in ('sun', 'planet', 'ring'):
+            return None
+        return PlanRecord(str(d['set']), role, int(d.get('index', 0)), int(d['sun_teeth']), int(d['planet_teeth']),
+                          int(d['planets']), float(d['module_mm']), math.radians(float(d['pressure_angle_deg'])),
+                          float(d.get('tooth_height_factor', 1.0)))
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Planetary sets
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Rule:
+    label: str
+    ok: bool
+    detail: str
+
+
+@dataclass
+class PlanetaryResult:
+    sun: GearParams
+    planet: GearParams
+    ring: GearParams
+    planets: int
+    rules: list[Rule]
+    warnings: list[str]
+    infos: list[str]
+    orbit_radius: float
+    ratio: float
+    cr_sun_planet: float
+    cr_planet_ring: float
+    trim: Optional[Trim]
+
+    @property
+    def ok(self) -> bool:
+        return all(r.ok for r in self.rules)
+
+    @property
+    def good(self) -> bool:
+        """Passes, and both contact ratios reach 1.2."""
+        return self.ok and min(self.cr_sun_planet, self.cr_planet_ring) >= CONTACT_RATIO_GOOD
+
+
+def planetary_params(module: float, pressure_angle: float, k: float, backlash: float,
+                     sun_teeth: int, planet_teeth: int) -> tuple[GearParams, GearParams, GearParams]:
+    sun = GearParams(module, sun_teeth, pressure_angle, backlash, EXTERNAL, k)
+    planet = GearParams(module, planet_teeth, pressure_angle, backlash, EXTERNAL, k)
+    ring = GearParams(module, sun_teeth + 2 * planet_teeth, pressure_angle, backlash, INTERNAL, k)
+    return sun, planet, ring
+
+
+def spacing_ok(sun_teeth: int, planet_teeth: int, planets: int) -> bool:
+    return (2 * sun_teeth + 2 * planet_teeth) % planets == 0
+
+
+def planet_gap(module: float, pressure_angle: float, k: float, backlash: float,
+               sun_teeth: int, planet_teeth: int, planets: int) -> float:
+    """Gap between neighbouring planets' tip circles."""
+    sun, planet, _ = planetary_params(module, pressure_angle, k, backlash, sun_teeth, planet_teeth)
+    orbit = sun.pitch_radius + planet.pitch_radius
+    return 2.0 * orbit * math.sin(math.pi / planets) - 2.0 * gear_radii(planet).tip
+
+
+@functools.lru_cache(maxsize=512)
+def check_planetary(module: float, pressure_angle: float, k: float, backlash: float,
+                    sun_teeth: int, planet_teeth: int, planets: int) -> PlanetaryResult:
+    sun, planet, ring = planetary_params(module, pressure_angle, k, backlash, sun_teeth, planet_teeth)
+    z_ring = ring.teeth
+    orbit = sun.pitch_radius + planet.pitch_radius
+    rules, warnings, infos = [], [], []
+
+    total = sun_teeth + z_ring
+    rules.append(Rule('Planets fit evenly', total % planets == 0,
+                      f'({sun_teeth} + {z_ring}) ÷ {planets} = {total / planets:g}'
+                      + ('' if total % planets == 0 else ', not a whole number')))
+
+    gap = planet_gap(module, pressure_angle, k, backlash, sun_teeth, planet_teeth, planets)
+    need = PLANET_GAP * module
+    rules.append(Rule('Planets clear each other', gap >= need,
+                      f'gap between planet tips {gap:.2f} mm (need {need:.2f} mm)'))
+
+    sp_collide = pair_collides(sun, planet)
+    cr_sp = pair_contact_ratio(sun, planet)
+    rules.append(Rule('Sun and planet mesh cleanly', not sp_collide and cr_sp >= CONTACT_RATIO_MIN,
+                      ('teeth collide' if sp_collide else f'contact ratio {cr_sp:.2f}')))
+
+    trim = ring_trim(ring, planet)
+    ring_radii = gear_radii(ring, (planet,))
+    cr_pr = contact_ratio(ring, ring_radii, planet, gear_radii(planet))
+    if not trim.clears:
+        detail = trim_failure_message(ring, trim)
     else:
-        off = p_b - p_a - 0.5
-    off = _frac(off)
-    return min(off, 1.0 - off)
+        detail = f'contact ratio {cr_pr:.2f}'
+        if ring_radii.trim is not None:
+            infos.append(f'Ring tips will be trimmed {ring_radii.trimmed_by:.2f} mm to clear the planets.')
+    rules.append(Rule('Planet and ring mesh cleanly', trim.clears and cr_pr >= CONTACT_RATIO_MIN, detail))
+
+    for label, cr in (('Sun–planet', cr_sp), ('Planet–ring', cr_pr)):
+        if CONTACT_RATIO_MIN <= cr < CONTACT_RATIO_GOOD:
+            warnings.append(f'{label} contact ratio {cr:.2f}: works, but runs rougher than 1.2 or more.')
+    return PlanetaryResult(sun, planet, ring, planets, rules, warnings, infos, orbit,
+                           1.0 + z_ring / sun_teeth, cr_sp, cr_pr, trim if trim.required_tip else None)
+
+
+def suggest_planetary(module: float, pressure_angle: float, k: float, backlash: float,
+                      sun_teeth: int, planet_teeth: int, planets: int,
+                      limit: int = 3, window: int = 10) -> list[tuple[int, int]]:
+    """Nearby (sun, planet) tooth counts that pass every rule with both contact ratios ≥ 1.2."""
+    target = 1.0 + (sun_teeth + 2 * planet_teeth) / sun_teeth
+    candidates = []
+    for zs in range(max(MIN_TEETH, sun_teeth - window), sun_teeth + window + 1):
+        for zp in range(max(MIN_TEETH, planet_teeth - window), planet_teeth + window + 1):
+            if (zs, zp) == (sun_teeth, planet_teeth) or zs + 2 * zp > MAX_TEETH:
+                continue
+            if not spacing_ok(zs, zp, planets):
+                continue
+            if planet_gap(module, pressure_angle, k, backlash, zs, zp, planets) < PLANET_GAP * module:
+                continue
+            ratio = 1.0 + (zs + 2 * zp) / zs
+            candidates.append((abs(zs - sun_teeth) + abs(zp - planet_teeth), abs(ratio - target), zs, zp))
+    found = []
+    for _, _, zs, zp in sorted(candidates):
+        # Cheap upper bounds first: trimming only lowers the ring's contact ratio, so an untrimmed
+        # ring below 1.2 can't pass; the full check (collision sweeps and trim) runs on the rest.
+        sun, planet, ring = planetary_params(module, pressure_angle, k, backlash, zs, zp)
+        if pair_contact_ratio(sun, planet) < CONTACT_RATIO_GOOD:
+            continue
+        if contact_ratio(ring, gear_radii(ring), planet, gear_radii(planet)) < CONTACT_RATIO_GOOD:
+            continue
+        if check_planetary(module, pressure_angle, k, backlash, zs, zp, planets).good:
+            found.append((zs, zp))
+            if len(found) == limit:
+                break
+    return found
 
 
 # ---------------------------------------------------------------------------

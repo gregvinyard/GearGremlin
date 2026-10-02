@@ -17,6 +17,7 @@ from ... import gearmath as gm
 ATTR_GROUP = 'GearGremlin'
 ATTR_NAME = 'gear'
 PART_NAME = 'part'  # on each drawn curve; value is the owning gear's id
+PLAN_NAME = 'plan'  # on circles drawn by the planetary helper
 
 _PLAIN_NUMBER = re.compile(r'^\s*[-+]?(\d+\.?\d*|\.\d+)([eE][-+]?\d+)?\s*(mm|cm|m|in|ft|")?\s*$')
 
@@ -58,6 +59,16 @@ def write_gear(circle: adsk.fusion.SketchCircle, record: gm.GearRecord) -> None:
     circle.attributes.add(ATTR_GROUP, ATTR_NAME, gm.to_attribute(record))
 
 
+def read_plan(circle: adsk.fusion.SketchCircle) -> Optional[gm.PlanRecord]:
+    """The planetary plan the helper stored on this circle, or None."""
+    attr = circle.attributes.itemByName(ATTR_GROUP, PLAN_NAME)
+    return gm.from_plan_attribute(attr.value) if attr else None
+
+
+def write_plan(circle: adsk.fusion.SketchCircle, plan: gm.PlanRecord) -> None:
+    circle.attributes.add(ATTR_GROUP, PLAN_NAME, gm.to_plan_attribute(plan))
+
+
 def gear_circles(sketch: adsk.fusion.Sketch) -> list:
     """All circles in the sketch that carry a gear attribute."""
     circles = sketch.sketchCurves.sketchCircles
@@ -80,23 +91,98 @@ def find_gear_circle(sketch: adsk.fusion.Sketch, gear_id: str) -> Optional[adsk.
 
 
 def tag_part(entity, gear_id: str) -> None:
-    """Mark a drawn curve as belonging to a gear, so an edit can find and replace it."""
+    """Mark a drawn curve as belonging to a gear, so an edit can find and replace it.
+
+    Only one curve per tooth (the tip arc) and the reference circles are tagged: attribute adds
+    are slow (several ms each, growing with the design), and the rest of a tooth loop is found
+    by following connected endpoints (see gear_parts).
+    """
     entity.attributes.add(ATTR_GROUP, PART_NAME, gear_id)
 
 
-def gear_parts(sketch: adsk.fusion.Sketch, gear_id: str) -> list:
-    """All curves drawn for the gear with this id (teeth and reference circles).
-
-    Uses one design-wide attribute search; reading attributes curve by curve is much slower.
-    """
-    result = []
+def _tagged(sketch: adsk.fusion.Sketch, gear_id: Optional[str] = None) -> list:
+    """(curve, gear id) for tagged curves in the sketch, from one design-wide attribute search."""
+    out = []
     for attr in sketch.parentComponent.parentDesign.findAttributes(ATTR_GROUP, PART_NAME):
-        if attr.value != gear_id:
+        if gear_id is not None and attr.value != gear_id:
             continue
         curve = adsk.fusion.SketchCurve.cast(attr.parent)
         if curve is not None and curve.parentSketch == sketch:
-            result.append(curve)
-    return result
+            out.append((curve, attr.value))
+    return out
+
+
+def _band(circle: adsk.fusion.SketchCircle, record: gm.GearRecord) -> tuple:
+    """Center and the radius band a gear's own curves lie in."""
+    p = record.params
+    reach = p.dedendum + 0.5 * p.module
+    return circle_center_mm(circle), p.pitch_radius - reach, p.pitch_radius + reach
+
+
+def _in_band(curve, center: gm.Point, lo: float, hi: float) -> bool:
+    for pt in (curve.startSketchPoint, curve.endSketchPoint):
+        g = pt.geometry
+        rho = math.hypot(to_mm(g.x) - center[0], to_mm(g.y) - center[1])
+        if not lo <= rho <= hi:
+            return False
+    return True
+
+
+def _walk(start, accept) -> list:
+    """Curves connected to `start` end to end (not through circles), for which accept(curve) holds."""
+    seen = {start.entityToken: start}
+    stack = [start]
+    while stack:
+        curve = stack.pop()
+        for pt in (curve.startSketchPoint, curve.endSketchPoint):
+            ents = pt.connectedEntities
+            for j in range(ents.count):
+                other = adsk.fusion.SketchCurve.cast(ents.item(j))
+                if other is None or adsk.fusion.SketchCircle.cast(other) is not None:
+                    continue
+                token = other.entityToken
+                if token in seen or not accept(other):
+                    continue
+                seen[token] = other
+                stack.append(other)
+    return list(seen.values())
+
+
+def _own_curve(gear_id: str, center: gm.Point, lo: float, hi: float):
+    """A curve that can belong to this gear's tooth loop: an arc or fitted spline in its radius
+    band, or (for gears made by older versions) any curve tagged with its id."""
+    def accept(curve) -> bool:
+        attr = curve.attributes.itemByName(ATTR_GROUP, PART_NAME)
+        if attr is not None:
+            return attr.value == gear_id
+        is_profile_type = (adsk.fusion.SketchArc.cast(curve) is not None
+                           or adsk.fusion.SketchFittedSpline.cast(curve) is not None)
+        return is_profile_type and _in_band(curve, center, lo, hi)
+    return accept
+
+
+def gear_parts(sketch: adsk.fusion.Sketch, gear_id: str) -> list:
+    """All curves drawn for the gear with this id: its tooth loop and reference circles."""
+    tagged = [c for c, _ in _tagged(sketch, gear_id)]
+    circle = find_gear_circle(sketch, gear_id)
+    if circle is None:
+        return tagged
+    center, lo, hi = _band(circle, read_gear(circle))
+    parts = {c.entityToken: c for c in tagged}
+    walked = set()
+    for c in tagged:
+        if adsk.fusion.SketchCircle.cast(c) is not None or c.entityToken in walked:
+            continue
+        # Measure against where the gear was when it was drawn: an edit may already have moved
+        # the pitch circle. A tagged tip arc's center is that point.
+        arc = adsk.fusion.SketchArc.cast(c)
+        if arc is not None:
+            g = arc.centerSketchPoint.geometry
+            center = (to_mm(g.x), to_mm(g.y))
+        for found in _walk(c, _own_curve(gear_id, center, lo, hi)):
+            parts[found.entityToken] = found
+            walked.add(found.entityToken)
+    return list(parts.values())
 
 
 def gear_for_entity(entity) -> Optional[adsk.fusion.SketchCircle]:
@@ -110,14 +196,44 @@ def gear_for_entity(entity) -> Optional[adsk.fusion.SketchCircle]:
     attr = curve.attributes.itemByName(ATTR_GROUP, PART_NAME)
     if attr:
         return find_gear_circle(curve.parentSketch, attr.value)
+    if circle is not None or (adsk.fusion.SketchArc.cast(curve) is None
+                              and adsk.fusion.SketchFittedSpline.cast(curve) is None):
+        return None
+    # An untagged tooth curve: walk along the loop to the nearest tagged one (a few steps).
+    sketch = curve.parentSketch
+    seen = {curve.entityToken}
+    frontier = [curve]
+    for _ in range(12):
+        nxt = []
+        for c in frontier:
+            for pt in (c.startSketchPoint, c.endSketchPoint):
+                ents = pt.connectedEntities
+                for j in range(ents.count):
+                    other = adsk.fusion.SketchCurve.cast(ents.item(j))
+                    if other is None or adsk.fusion.SketchCircle.cast(other) is not None:
+                        continue
+                    if other.entityToken in seen:
+                        continue
+                    seen.add(other.entityToken)
+                    tag = other.attributes.itemByName(ATTR_GROUP, PART_NAME)
+                    if tag:
+                        found = find_gear_circle(sketch, tag.value)
+                        if found is not None:
+                            center, lo, hi = _band(found, read_gear(found))
+                            if _in_band(curve, center, lo, hi):
+                                return found
+                    nxt.append(other)
+        frontier = nxt
+        if not frontier:
+            break
     return None
 
 
 def delete_gear_parts(sketch: adsk.fusion.Sketch, gear_id: str) -> None:
     """Delete all of a gear's curves in one operation (deleting them one by one is ~100× slower).
 
-    Each curve's tag is removed first: attributes outlive their deleted entities, and the
-    leftovers pile up with every edit and make attribute adds over 10× slower.
+    Tags are removed first: attributes outlive their deleted entities, and the leftovers pile
+    up with every edit and make attribute adds over 10× slower.
     """
     parts = adsk.core.ObjectCollection.create()
     for c in gear_parts(sketch, gear_id):
@@ -183,7 +299,10 @@ def resize_circle(sketch: adsk.fusion.Sketch, circle: adsk.fusion.SketchCircle, 
     if error:
         result.error = error
         return result
-    if abs(circle_radius_mm(circle) * 2 - diameter_mm) < 1e-9 and size_dimension(circle):
+    if abs(circle_radius_mm(circle) * 2 - diameter_mm) < 1e-6 and (size_dimension(circle)
+                                                                   or circle.isFullyConstrained):
+        # Already right, and held there (by a dimension, or by constraints as in a planetary set).
+        # Skipping matters: any dimension change re-solves the whole sketch.
         return result
 
     temporarily_fixed = []
@@ -287,6 +406,7 @@ def draw_reference_circles(sketch: adsk.fusion.Sketch, circle: adsk.fusion.Sketc
 class GearResult:
     errors: list = field(default_factory=list)
     warnings: list = field(default_factory=list)
+    infos: list = field(default_factory=list)
     profile: Optional[gm.Profile] = None
     theta0: float = 0.0
     entities: list = field(default_factory=list)
@@ -294,6 +414,32 @@ class GearResult:
     @property
     def ok(self) -> bool:
         return not self.errors
+
+
+def _tangent(a: gm.GearParams, ca: gm.Point, b: gm.GearParams, cb: gm.Point) -> bool:
+    if a.internal and b.internal:
+        return False
+    return abs(math.dist(ca, cb) - gm.expected_center_distance(a, b)) <= gm.TANGENCY_TOL_MM
+
+
+def ring_pinions(circle: adsk.fusion.SketchCircle, params: gm.GearParams, center: gm.Point,
+                 partner: Optional[adsk.fusion.SketchCircle]) -> tuple:
+    """External gears a ring must be trimmed against: its Mesh with partner, gears already
+    tangent inside it, and its planetary plan's planets."""
+    pinions = []
+    for c in gear_circles(circle.parentSketch):
+        if c == circle:
+            continue
+        record = read_gear(c)
+        if record is None or record.params.internal:
+            continue
+        if c == partner or _tangent(params, center, record.params, circle_center_mm(c)):
+            pinions.append(record.params)
+    plan = read_plan(circle)
+    if plan is not None and plan.role == 'ring':
+        pinions.append(plan.planet_params(params.backlash))
+    # Only pinions of the same system can mesh; identical parameters give identical trims.
+    return tuple(dict.fromkeys(p for p in pinions if gm.same_system(p, params)))
 
 
 def make_gear(circle: adsk.fusion.SketchCircle, params: gm.GearParams, resize: bool = True,
@@ -358,48 +504,103 @@ def make_gear(circle: adsk.fusion.SketchCircle, params: gm.GearParams, resize: b
         theta0 = gm.align_theta0(params, center, partner_record.params, partner_center, partner_record.theta0)
     theta0 += rotation_offset
 
-    profile = gm.build_profile(params, center, theta0)
+    # Drawn radii. A ring is trimmed (from scratch, also on edit) against every pinion it meets.
+    if params.internal:
+        pinions = ring_pinions(circle, params, center, partner)
+        radii = gm.gear_radii(params, pinions)
+        result.infos += ring_trim_notes(radii, pinions)
+        result.warnings += [gm.trim_failure_message(params, t) for t in radii.failed]
+    else:
+        radii = gm.gear_radii(params)
+
+    planned = read_plan(circle) is not None
+    if partner_record is not None:
+        report = gm.pair_report(params, radii, partner_record.params, partner_record.drawn_tip, planned)
+        result.infos += report.infos
+        result.warnings += [w for w in report.warnings if w not in result.warnings]
+    if not params.internal:
+        # Rings this gear sits in, other than the partner: are their tips trimmed enough for it?
+        for c, record in _tangent_gears(sketch, circle, params, center):
+            if c != partner and record.params.internal:
+                report = gm.pair_report(params, radii, record.params, record.drawn_tip, planned)
+                result.warnings += [w for w in report.warnings if 'ring' in w and w not in result.warnings]
+
+    profile = gm.build_profile(params, center, theta0, radii=radii)
     result.profile = profile
     result.theta0 = theta0
-    # Tagging inside the deferred block matters: each attribute add otherwise triggers a
-    # recompute of features built on the sketch (seconds per gear once it's extruded).
     if edit:
         # Only now, once resizing and alignment have succeeded, so a failed edit keeps the old gear.
         delete_gear_parts(sketch, gear_id)
+    # Tagging inside the deferred block matters: each attribute add otherwise triggers a
+    # recompute of features built on the sketch.
     deferred = sketch.isComputeDeferred
     sketch.isComputeDeferred = True
     try:
         result.entities = draw_profile(sketch, profile)
+        # Tag each tooth's tip arc; the rest of the loop is found from these (see tag_part).
+        # Tags only matter once the gear exists, so the preview skips them (they cost ~6 ms each).
+        if finalize:
+            for seg, ent in zip(profile.segments, result.entities):
+                if isinstance(seg, gm.Arc) and abs(seg.radius - radii.tip) < 1e-9:
+                    tag_part(ent, gear_id)
         if reference_circles:
-            result.entities += draw_reference_circles(sketch, circle, profile)
-        for ent in result.entities:
-            tag_part(ent, gear_id)
+            refs = draw_reference_circles(sketch, circle, profile)
+            if finalize:
+                for ent in refs:
+                    tag_part(ent, gear_id)
+            result.entities += refs
     finally:
         sketch.isComputeDeferred = deferred
-    if edit:
-        result.warnings += dependent_warnings(sketch, gear_id, params, center, theta0)
+    result.warnings += neighbor_warnings(sketch, circle, gear_id, params, center, theta0)
     if finalize:
         circle.isConstruction = True
         write_gear(circle, gm.GearRecord(
             params=params, theta0=theta0, gear_id=gear_id, rotation_offset=rotation_offset,
             resize=resize, reference_circles=reference_circles,
-            mesh_with=partner_record.gear_id if partner_record else ''))
+            mesh_with=partner_record.gear_id if partner_record else '', tip_radius=radii.tip))
     return result
 
 
-def dependent_warnings(sketch: adsk.fusion.Sketch, gear_id: str, params: gm.GearParams,
-                       center: gm.Point, theta0: float) -> list:
-    """Warnings for gears that were aligned to this one and no longer mesh with it."""
+def ring_trim_notes(radii: gm.Radii, pinions: tuple) -> list:
+    if not pinions:
+        return ['Tip trim depends on the pinion. Set Mesh with, or edit the ring after making its pinions.']
+    if radii.trim is None:
+        return []
+    return [f'Ring tips trimmed {radii.trimmed_by:.2f} mm (tip ⌀ {2 * radii.tip:.2f} mm) to clear the '
+            f'{radii.trim.pinion.teeth}-tooth pinion.']
+
+
+def _tangent_gears(sketch: adsk.fusion.Sketch, circle: adsk.fusion.SketchCircle, params: gm.GearParams,
+                   center: gm.Point) -> list:
+    out = []
+    for c in gear_circles(sketch):
+        if c == circle:
+            continue
+        record = read_gear(c)
+        if record is not None and _tangent(params, center, record.params, circle_center_mm(c)):
+            out.append((c, record))
+    return out
+
+
+def neighbor_warnings(sketch: adsk.fusion.Sketch, circle: adsk.fusion.SketchCircle, gear_id: str,
+                      params: gm.GearParams, center: gm.Point, theta0: float) -> list:
+    """Out-of-phase check: every tangent gear, plus gears aligned to this one (even if an edit made
+    them no longer tangent), must still mesh with it."""
     warnings = []
     for c in gear_circles(sketch):
+        if c == circle:
+            continue
         record = read_gear(c)
-        if record is None or record.mesh_with != gear_id:
+        if record is None or (params.internal and record.params.internal):
             continue
         other_center = circle_center_mm(c)
-        mesh = gm.check_mesh(record.params, other_center, params, center, circle_radius_mm(c))
+        dependent = bool(gear_id) and record.mesh_with == gear_id
+        if not dependent and not _tangent(params, center, record.params, other_center):
+            continue
+        compatible = gm.same_system(params, record.params)
         spacing = math.dist(center, other_center) - gm.expected_center_distance(params, record.params)
         aligned = gm.mesh_error(params, center, theta0, record.params, other_center, record.theta0) <= 1e-6
-        if mesh.errors or abs(spacing) > gm.TANGENCY_TOL_MM or not aligned:
+        if not compatible or abs(spacing) > gm.TANGENCY_TOL_MM or not aligned:
             warnings.append(f'The {record.params.teeth}-tooth gear meshed with this one no longer lines up. '
                             'Edit it to re-align.')
-    return warnings
+    return list(dict.fromkeys(warnings))

@@ -11,6 +11,8 @@ DEFAULTS = {
     'pressure_angle_deg': 20.0,
     'gear_type': 'external',
     'backlash_mm': 0.05,
+    'height_factor': 1.0,
+    'height_custom': False,
 }
 
 _current = None
@@ -35,8 +37,10 @@ def load() -> dict:
 
 
 def save(values: dict) -> None:
+    """Store the given settings; keys not given keep their current value."""
     global _current
-    _current = {key: values.get(key, default) for key, default in DEFAULTS.items()}
+    current = load()
+    _current = {key: values.get(key, current[key]) for key in DEFAULTS}
     for key, value in _current.items():
         if isinstance(value, float):
             _current[key] = round(value, 6)  # unit conversions leave float noise

@@ -8,6 +8,7 @@ import adsk.fusion
 from ...lib import fusionAddInUtils as futil
 from ... import config
 from ... import gearmath as gm
+from ..common import inputs as ci
 from . import drawing
 from . import settings
 
@@ -30,30 +31,25 @@ ICON_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'resource
 
 local_handlers = []
 
-# Input ids
+# Input ids (module, pressure angle, tooth height and backlash ids live in common.inputs)
 PITCH = 'pitch_circle'
 GEAR_TYPE = 'gear_type'
-MODULE = 'module'
-MODULE_CUSTOM = 'module_custom'
-PRESSURE = 'pressure_angle'
 TEETH = 'teeth'
 RESIZE = 'resize'
 MESH = 'mesh_with'
 ROTATION = 'rotation'
-BACKLASH = 'backlash'
 REFS = 'reference_circles'
 INFO = 'info'
 
-CUSTOM = 'Custom'
 TYPE_NAMES = {gm.EXTERNAL: 'External', gm.INTERNAL: 'Internal'}
 
 # Circle diameters (mm) as they were when the command started, keyed by entityToken.
 # Preview resizes circles, so reading them live while a preview is up could show the new size.
 _original_diameters = {}
 
-# Last HTML written to the info box. Compared against this rather than the box's
+# Last HTML written to each text box. Compared against this rather than the box's
 # formattedText, which Fusion may hand back reformatted.
-_last_info = None
+_last_text = {}
 
 # The gear being edited, or None when creating a new gear.
 _edit_circle: Optional[adsk.fusion.SketchCircle] = None
@@ -116,10 +112,6 @@ def marking_menu_displaying(args: adsk.core.MarkingMenuEventArgs):
 # Dialog
 # ---------------------------------------------------------------------------
 
-def _module_label(m: float) -> str:
-    return f'{m:g} mm'
-
-
 def _tip(cmd_input, text: str) -> None:
     cmd_input.tooltip = text
 
@@ -141,6 +133,7 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
             preselected = adsk.fusion.SketchCircle.cast(entity)
 
     _original_diameters.clear()
+    _last_text.clear()
     _cache_diameters(preselected.parentSketch if preselected else
                      adsk.fusion.Sketch.cast(app.activeEditObject))
 
@@ -161,22 +154,9 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
         gear_type.listItems.add(name, key == remembered['gear_type'])
     _tip(gear_type, 'External gears have teeth pointing out. Internal (ring) gears have teeth pointing in.')
 
-    module = inputs.addDropDownCommandInput(MODULE, 'Module', adsk.core.DropDownStyles.TextListDropDownStyle)
-    custom = remembered['module_custom'] or remembered['module_mm'] not in gm.STANDARD_MODULES_MM
-    for m in gm.STANDARD_MODULES_MM:
-        module.listItems.add(_module_label(m), not custom and m == remembered['module_mm'])
-    module.listItems.add(CUSTOM, custom)
-    _tip(module, 'Tooth size: pitch diameter ÷ tooth count. Gears must share a module to mesh.')
-
-    module_custom = inputs.addValueInput(MODULE_CUSTOM, 'Custom module', 'mm',
-                                         adsk.core.ValueInput.createByString(f'{remembered["module_mm"]} mm'))
-    module_custom.isVisible = custom
-    _tip(module_custom, 'Tooth size: pitch diameter ÷ tooth count. Gears must share a module to mesh.')
-
-    pressure = inputs.addDropDownCommandInput(PRESSURE, 'Pressure angle', adsk.core.DropDownStyles.TextListDropDownStyle)
-    for deg in gm.PRESSURE_ANGLES_DEG:
-        pressure.listItems.add(f'{deg:g}°', deg == remembered['pressure_angle_deg'])
-    _tip(pressure, 'Slope of the tooth faces. 20° is standard. Meshing gears must match.')
+    ci.add_module(inputs, remembered)
+    ci.add_pressure(inputs, remembered)
+    ci.add_height(inputs, remembered)
 
     teeth = inputs.addIntegerSpinnerCommandInput(TEETH, 'Teeth', gm.MIN_TEETH, gm.MAX_TEETH, 1,
                                                  remembered.get('teeth', 20))
@@ -195,14 +175,12 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
                                                 adsk.core.ValueInput.createByReal(remembered.get('rotation', 0.0)))
     _tip(rotation, 'Extra rotation of the teeth, added after any automatic alignment.')
 
-    backlash = inputs.addValueInput(BACKLASH, 'Backlash', 'mm',
-                                    adsk.core.ValueInput.createByString(f'{remembered["backlash_mm"]} mm'))
-    _tip(backlash, 'Play between meshing teeth, split between the two gears. 3D-printed gears usually need about 0.1–0.2 mm.')
+    ci.add_backlash(inputs, remembered)
 
     inputs.addBoolValueInput(REFS, 'Draw reference circles', True, '', remembered.get('reference_circles', False))
-    _tip(inputs.itemById(REFS), 'Adds the tip and root circles as construction geometry.')
+    _tip(inputs.itemById(REFS), 'Adds the tip and root circles (as drawn) as construction geometry.')
 
-    inputs.addTextBoxCommandInput(INFO, '', '', 5, True)
+    inputs.addTextBoxCommandInput(INFO, '', '', 6, True)
 
     if record is not None:
         pitch.addSelection(_edit_circle)
@@ -212,8 +190,10 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
             mesh.addSelection(partner)
     elif preselected and drawing.read_gear(preselected) is None:
         pitch.addSelection(preselected)
+        if not _apply_plan(inputs, preselected):
+            _suggest_teeth(inputs)
         mesh.hasFocus = True
-        _suggest_teeth(inputs)
+    _sync_height(inputs)
 
     cmd = args.command
     futil.add_handler(cmd.execute, command_execute, local_handlers=local_handlers)
@@ -231,6 +211,8 @@ def _record_values(record: gm.GearRecord) -> dict:
         'module_mm': params.module,
         'module_custom': params.module not in gm.STANDARD_MODULES_MM,
         'pressure_angle_deg': round(math.degrees(params.pressure_angle), 6),
+        'height_factor': params.height_factor,
+        'height_custom': params.height_factor not in ci.HEIGHT_LABELS.values(),
         'gear_type': params.gear_type,
         'backlash_mm': params.backlash,
         'teeth': params.teeth,
@@ -238,6 +220,41 @@ def _record_values(record: gm.GearRecord) -> dict:
         'rotation': record.rotation_offset,
         'reference_circles': record.reference_circles,
     }
+
+
+def _apply_plan(inputs, circle: adsk.fusion.SketchCircle) -> bool:
+    """Preset type, teeth, module, pressure angle, height and Mesh with from a planetary plan."""
+    plan = drawing.read_plan(circle)
+    if plan is None:
+        return False
+    dropdown = inputs.itemById(GEAR_TYPE)
+    for i in range(dropdown.listItems.count):
+        item = dropdown.listItems.item(i)
+        item.isSelected = item.name == TYPE_NAMES[plan.gear_type]
+    ci.set_module(inputs, plan.module)
+    ci.set_pressure(inputs, math.degrees(plan.pressure_angle))
+    ci.set_height(inputs, plan.height_factor)
+    inputs.itemById(TEETH).value = plan.teeth
+    partner = _plan_partner(circle, plan)
+    mesh = inputs.itemById(MESH)
+    mesh.clearSelection()
+    if partner is not None:
+        mesh.addSelection(partner)
+    return True
+
+
+def _plan_partner(circle: adsk.fusion.SketchCircle, plan: gm.PlanRecord) -> Optional[adsk.fusion.SketchCircle]:
+    """The Mesh with partner that keeps a planetary set aligned (see SPEC: "Plan attribute")."""
+    made = {'sun': [], 'planet': [], 'ring': []}
+    for c in drawing.gear_circles(circle.parentSketch):
+        other = drawing.read_plan(c)
+        if other is not None and other.set_id == plan.set_id and c != circle:
+            made[other.role].append(c)
+    order = {'planet': ('sun', 'planet', 'ring'), 'ring': ('planet',), 'sun': ('planet',)}[plan.role]
+    for role in order:
+        if made[role]:
+            return made[role][0]
+    return None
 
 
 def _cache_diameters(sketch: Optional[adsk.fusion.Sketch]) -> None:
@@ -267,38 +284,56 @@ def _selected_circle(inputs, input_id: str) -> Optional[adsk.fusion.SketchCircle
     return adsk.fusion.SketchCircle.cast(sel.selection(0).entity)
 
 
-def _module_mm(inputs) -> float:
-    item = inputs.itemById(MODULE).selectedItem
-    if item is None or item.name == CUSTOM:
-        return drawing.to_mm(inputs.itemById(MODULE_CUSTOM).value)
-    return float(item.name.split()[0])
-
-
 def _gear_type(inputs) -> str:
     item = inputs.itemById(GEAR_TYPE).selectedItem
     return gm.INTERNAL if item and item.name == TYPE_NAMES[gm.INTERNAL] else gm.EXTERNAL
 
 
-def _pressure_deg(inputs) -> float:
-    item = inputs.itemById(PRESSURE).selectedItem
-    return float(item.name.rstrip('°')) if item else 20.0
-
-
 def _params(inputs) -> gm.GearParams:
     return gm.GearParams(
-        module=_module_mm(inputs),
+        module=ci.module_mm(inputs),
         teeth=inputs.itemById(TEETH).value,
-        pressure_angle=math.radians(_pressure_deg(inputs)),
-        backlash=drawing.to_mm(inputs.itemById(BACKLASH).value),
+        pressure_angle=ci.pressure_rad(inputs),
+        backlash=ci.backlash_mm(inputs),
         gear_type=_gear_type(inputs),
+        height_factor=ci.height_factor(inputs),
     )
+
+
+def _partner_record(inputs) -> Optional[gm.GearRecord]:
+    partner = _selected_circle(inputs, MESH)
+    return drawing.read_gear(partner) if partner is not None else None
 
 
 def _suggest_teeth(inputs) -> None:
     circle = _selected_circle(inputs, PITCH)
-    module = _module_mm(inputs)
+    module = ci.module_mm(inputs)
     if circle and module > 0:
         inputs.itemById(TEETH).value = gm.clamp_teeth(gm.suggest_teeth(_original_diameter(circle), module))
+
+
+def _sync_height(inputs) -> None:
+    """Lock the tooth height to the Mesh with partner's, or unlock it, and refresh the note."""
+    record = _partner_record(inputs)
+    if record is not None:
+        ci.set_height(inputs, record.params.height_factor)
+    ci.lock_height(inputs, record is not None)
+    _update_height_note(inputs)
+
+
+def _update_height_note(inputs) -> None:
+    try:
+        params = _params(inputs)
+    except Exception:
+        params = None
+    record = _partner_record(inputs)
+    note = ''
+    if params is not None and params.module > 0 and params.teeth >= gm.MIN_TEETH:
+        partner = record.params if record is not None else None
+        if partner is not None and (partner.internal and params.internal):
+            partner = None
+        note = ci.height_note(params, partner)
+    _set_text(inputs, ci.HEIGHT_NOTE, f'<span style="color:#707070">{note}</span>' if note else '')
 
 
 # ---------------------------------------------------------------------------
@@ -349,18 +384,19 @@ def _pre_check(inputs) -> gm.Check:
     return check
 
 
-def _info_html(inputs, errors: list, warnings: list) -> str:
+def _info_html(inputs, errors: list, warnings: list, infos: list, radii: Optional[gm.Radii]) -> str:
     lines = []
     circle = _selected_circle(inputs, PITCH)
-    module = _module_mm(inputs)
+    module = ci.module_mm(inputs)
     if circle is not None and module > 0:
         params = _params(inputs)
         d0 = _original_diameter(circle)
         pitch_d = 2 * params.pitch_radius
         lines.append(f'{d0:.2f} mm → {pitch_d:.2f} mm ({pitch_d - d0:+.2f} mm), {params.teeth} teeth')
         if params.teeth >= gm.MIN_TEETH:
-            ra, rf, _ = gm.drawn_radii(params)
-            lines.append(f'Tip ⌀ {2 * ra:.2f} mm, root ⌀ {2 * rf:.2f} mm')
+            r = radii if radii is not None else gm.gear_radii(params)
+            lines.append(f'Tip ⌀ {2 * r.tip:.2f} mm, root ⌀ {2 * r.root:.2f} mm')
+    lines += list(dict.fromkeys(infos))
     for e in errors:
         lines.append(f'<span style="color:#d03030">✖ {e}</span>')
     for w in dict.fromkeys(warnings):
@@ -368,12 +404,14 @@ def _info_html(inputs, errors: list, warnings: list) -> str:
     return '<br>'.join(lines)
 
 
-def _set_info(inputs, errors: list, warnings: list) -> None:
-    global _last_info
-    html = _info_html(inputs, errors, warnings)
-    if html != _last_info:
-        _last_info = html
-        inputs.itemById(INFO).formattedText = html
+def _set_text(inputs, input_id: str, html: str) -> None:
+    if _last_text.get(input_id) != html:
+        _last_text[input_id] = html
+        inputs.itemById(input_id).formattedText = html
+
+
+def _set_info(inputs, errors: list, warnings: list, infos: list = (), radii: Optional[gm.Radii] = None) -> None:
+    _set_text(inputs, INFO, _info_html(inputs, errors, warnings, list(infos), radii))
 
 
 # ---------------------------------------------------------------------------
@@ -396,7 +434,8 @@ def _run(inputs, finalize: bool) -> drawing.GearResult:
             edit=_edit_circle is not None,
         )
         result.warnings = check.warnings + result.warnings
-    _set_info(inputs, result.errors, result.warnings)
+    radii = result.profile.radii if result.profile is not None else None
+    _set_info(inputs, result.errors, result.warnings, result.infos, radii)
     return result
 
 
@@ -410,13 +449,9 @@ def command_execute(args: adsk.core.CommandEventArgs):
         return
     if _edit_circle is not None:
         return  # editing one gear shouldn't change the defaults for new gears
-    settings.save({
-        'module_mm': _module_mm(inputs),
-        'module_custom': inputs.itemById(MODULE).selectedItem.name == CUSTOM,
-        'pressure_angle_deg': _pressure_deg(inputs),
-        'gear_type': _gear_type(inputs),
-        'backlash_mm': drawing.to_mm(inputs.itemById(BACKLASH).value),
-    })
+    values = ci.remembered_values(inputs)
+    values['gear_type'] = _gear_type(inputs)
+    settings.save(values)
 
 
 def command_preview(args: adsk.core.CommandEventArgs):
@@ -428,14 +463,22 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     changed = args.input
     inputs = args.inputs
     futil.log(f'{CMD_NAME} Input Changed Event fired from a change to {changed.id}')
-    if changed.id == MODULE:
-        inputs.itemById(MODULE_CUSTOM).isVisible = inputs.itemById(MODULE).selectedItem.name == CUSTOM
+    ci.on_changed(inputs, changed.id)
+    planned = False
+    if changed.id == PITCH and _edit_circle is None:
+        circle = _selected_circle(inputs, PITCH)
+        planned = circle is not None and _apply_plan(inputs, circle)
     # In edit mode the pitch circle is locked and the stored tooth count wins; only a module
-    # change re-suggests.
-    if changed.id in (MODULE, MODULE_CUSTOM) or (changed.id == PITCH and _edit_circle is None):
+    # change re-suggests. A planned circle's tooth count comes from its plan.
+    if changed.id in (ci.MODULE, ci.MODULE_CUSTOM) or (changed.id == PITCH and _edit_circle is None and not planned):
         _suggest_teeth(inputs)
     if changed.id == PITCH and _selected_circle(inputs, PITCH) is not None:
         inputs.itemById(MESH).hasFocus = True
+    if changed.id in (MESH, PITCH):
+        _sync_height(inputs)
+    elif changed.id in (ci.MODULE, ci.MODULE_CUSTOM, ci.PRESSURE, ci.HEIGHT, ci.HEIGHT_CUSTOM, TEETH,
+                        GEAR_TYPE, ci.BACKLASH):
+        _update_height_note(inputs)
 
 
 def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
@@ -459,8 +502,8 @@ def command_pre_select(args: adsk.core.SelectionEventArgs):
 
 def command_destroy(args: adsk.core.CommandEventArgs):
     futil.log(f'{CMD_NAME} Command Destroy Event')
-    global local_handlers, _last_info, _edit_circle
+    global local_handlers, _edit_circle
     local_handlers = []
-    _last_info = None
+    _last_text.clear()
     _edit_circle = None
     _original_diameters.clear()
