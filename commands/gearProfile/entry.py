@@ -357,7 +357,7 @@ def _pre_check(inputs) -> gm.Check:
             check.errors.append("This gear was made by an older GearGremlin and can't be edited. "
                                 'Delete it and make it again.')
             return check
-        check.warnings.append('If you extruded this gear, reselect its profile in that feature after updating.')
+        check.infos.append('Extrudes and revolves made from this gear are re-pointed to the new profile on Update.')
     elif drawing.read_gear(circle) is not None:
         check.errors.append('This circle is already a gear. Pick a different circle.')
         return check
@@ -421,7 +421,7 @@ def _set_info(inputs, errors: list, warnings: list, infos: list = (), radii: Opt
 def _run(inputs, finalize: bool) -> drawing.GearResult:
     check = _pre_check(inputs)
     if check.errors:
-        result = drawing.GearResult(errors=check.errors, warnings=check.warnings)
+        result = drawing.GearResult(errors=check.errors, warnings=check.warnings, infos=check.infos)
     else:
         result = drawing.make_gear(
             _selected_circle(inputs, PITCH),
@@ -434,6 +434,7 @@ def _run(inputs, finalize: bool) -> drawing.GearResult:
             edit=_edit_circle is not None,
         )
         result.warnings = check.warnings + result.warnings
+        result.infos = check.infos + result.infos
     radii = result.profile.radii if result.profile is not None else None
     _set_info(inputs, result.errors, result.warnings, result.infos, radii)
     return result
@@ -448,6 +449,14 @@ def command_execute(args: adsk.core.CommandEventArgs):
         args.executeFailedMessage = '\n'.join(result.errors)
         return
     if _edit_circle is not None:
+        if drawing.repoint_restored:
+            futil.log_to_file('Settings restored after re-pointing: ' + '; '.join(drawing.repoint_restored))
+        if drawing.repoint_errors:
+            futil.log_to_file('Re-pointing features after editing a gear: ' + '; '.join(drawing.repoint_errors))
+        if result.not_repointed:
+            ui.messageBox('The gear was updated, but these features couldn\'t be re-pointed to its new profile: '
+                          f'{", ".join(result.not_repointed)}.\n\nEdit each one and reselect its profile.',
+                          CMD_NAME)
         return  # editing one gear shouldn't change the defaults for new gears
     values = ci.remembered_values(inputs)
     values['gear_type'] = _gear_type(inputs)

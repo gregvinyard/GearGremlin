@@ -410,6 +410,8 @@ class GearResult:
     profile: Optional[gm.Profile] = None
     theta0: float = 0.0
     entities: list = field(default_factory=list)
+    repointed: list = field(default_factory=list)       # feature names kept attached through an edit
+    not_repointed: list = field(default_factory=list)   # feature names that couldn't be
 
     @property
     def ok(self) -> bool:
@@ -528,7 +530,15 @@ def make_gear(circle: adsk.fusion.SketchCircle, params: gm.GearParams, resize: b
     profile = gm.build_profile(params, center, theta0, radii=radii)
     result.profile = profile
     result.theta0 = theta0
+    repoint = None
     if edit:
+        if finalize:
+            # Features using regions bounded by this gear are moved onto a temporary region before
+            # the old curves go, and onto the new gear's regions after (see "Keeping features attached").
+            captured = capture_features(sketch, {c.entityToken for c in gear_parts(sketch, gear_id)})
+            if captured:
+                repoint = _Repoint(sketch, captured)
+                repoint.park()
         # Only now, once resizing and alignment have succeeded, so a failed edit keeps the old gear.
         delete_gear_parts(sketch, gear_id)
     # Tagging inside the deferred block matters: each attribute add otherwise triggers a
@@ -558,7 +568,282 @@ def make_gear(circle: adsk.fusion.SketchCircle, params: gm.GearParams, resize: b
             params=params, theta0=theta0, gear_id=gear_id, rotation_offset=rotation_offset,
             resize=resize, reference_circles=reference_circles,
             mesh_with=partner_record.gear_id if partner_record else '', tip_radius=radii.tip))
+        if repoint is not None:
+            result.repointed, result.not_repointed = repoint.finish({e.entityToken for e in result.entities})
     return result
+
+
+# ---------------------------------------------------------------------------
+# Keeping features attached through an edit
+# ---------------------------------------------------------------------------
+
+# Why the last re-point left features alone, and which reset settings it put back (log and tests).
+repoint_errors: list = []
+repoint_restored: list = []
+
+
+@dataclass
+class _Captured:
+    """A feature that uses regions of the edited sketch, and how to find each region again."""
+    feature: object
+    keys: list      # per profile: ('gear', other curve tokens) if bounded by the gear, else ('keep', all tokens)
+    settings: list = field(default_factory=list)   # extent settings to restore, see _extent_settings
+
+
+def _extent_definitions(feature) -> list:
+    """The feature's extent definitions, in a stable order (index 0, 1, ...)."""
+    out = []
+    ext = adsk.fusion.ExtrudeFeature.cast(feature)
+    if ext is not None:
+        for name in ('extentOne', 'extentTwo'):
+            try:
+                definition = getattr(ext, name)
+            except Exception:
+                definition = None
+            out.append(definition)
+    rev = adsk.fusion.RevolveFeature.cast(feature)
+    if rev is not None:
+        out.append(rev.extentDefinition)
+    return out
+
+
+_FLAGS = {adsk.fusion.SymmetricExtentDefinition: ('isFullLength',),
+          adsk.fusion.AngleExtentDefinition: ('isSymmetric',)}
+_PARAMS = {adsk.fusion.SymmetricExtentDefinition: ('distance', 'taperAngle'),
+           adsk.fusion.DistanceExtentDefinition: ('distance',),
+           adsk.fusion.AngleExtentDefinition: ('angle',),
+           adsk.fusion.TwoSidesAngleExtentDefinition: ('angleOne', 'angleTwo')}
+
+
+def _extent_settings(feature) -> list:
+    """Settings that setting a feature's profile can reset, as (where, name, kind, value).
+
+    Setting an extrude's profile through the API turns a symmetric "Whole Length" extent into
+    "Half Length", doubling its height. Flags and parameter expressions are recorded so they can
+    be put back.
+    """
+    settings = []
+    for i, definition in enumerate(_extent_definitions(feature)):
+        if definition is None:
+            continue
+        for cls, names in _FLAGS.items():
+            typed = cls.cast(definition)
+            if typed is not None:
+                settings += [(i, n, 'flag', getattr(typed, n)) for n in names]
+        for cls, names in _PARAMS.items():
+            typed = cls.cast(definition)
+            if typed is not None:
+                for n in names:
+                    param = adsk.fusion.ModelParameter.cast(getattr(typed, n))
+                    if param is not None:
+                        settings.append((i, n, 'param', param.expression))
+    ext = adsk.fusion.ExtrudeFeature.cast(feature)
+    if ext is not None:
+        for n in ('taperAngleOne', 'taperAngleTwo'):
+            try:
+                param = getattr(ext, n)
+            except Exception:
+                param = None
+            if param is not None:
+                settings.append(('feature', n, 'param', param.expression))
+    return settings
+
+
+def _restore_extent_settings(feature, settings: list) -> list:
+    """Put back any recorded setting that changed. Returns descriptions of what was restored."""
+    restored = []
+    definitions = _extent_definitions(feature)
+    for where, name, kind, value in settings:
+        if where == 'feature':
+            owner = feature
+        else:
+            owner = definitions[where] if where < len(definitions) else None
+            if owner is None:
+                continue
+            owner = next((cls.cast(owner) for cls in (*_FLAGS, *_PARAMS) if cls.cast(owner) is not None), owner)
+        try:
+            current = getattr(owner, name)
+        except Exception:
+            continue
+        if kind == 'flag':
+            if current != value:
+                setattr(owner, name, value)
+                restored.append(f'{name}={value}')
+        else:
+            param = adsk.fusion.ModelParameter.cast(current)
+            if param is not None and param.expression != value:
+                param.expression = value
+                restored.append(f'{name}={value}')
+    return restored
+
+
+def _profile_curves(profile) -> frozenset:
+    tokens = set()
+    for i in range(profile.profileLoops.count):
+        loop = profile.profileLoops.item(i)
+        for j in range(loop.profileCurves.count):
+            tokens.add(loop.profileCurves.item(j).sketchEntity.entityToken)
+    return frozenset(tokens)
+
+
+def _feature_profiles(feature) -> Optional[list]:
+    """The feature's input profiles, or None if any input isn't a sketch profile (faces etc.)."""
+    try:
+        value = feature.profile
+    except Exception:
+        return None
+    if value is None:
+        return None
+    coll = adsk.core.ObjectCollection.cast(value)
+    items = [coll.item(i) for i in range(coll.count)] if coll is not None else [value]
+    profiles = [adsk.fusion.Profile.cast(v) for v in items]
+    return None if any(p is None for p in profiles) else profiles
+
+
+def _profile_features(component: adsk.fusion.Component) -> list:
+    feats = component.features
+    out = []
+    for collection in (feats.extrudeFeatures, feats.revolveFeatures):
+        for i in range(collection.count):
+            out.append(collection.item(i))
+    return out
+
+
+def capture_features(sketch: adsk.fusion.Sketch, gear_tokens: set) -> list:
+    """Features (extrudes, revolves) that use a region of this sketch bounded by the gear's curves."""
+    design = sketch.parentComponent.parentDesign
+    if design.designType != adsk.fusion.DesignTypes.ParametricDesignType:
+        return []
+    captured = []
+    for feature in _profile_features(sketch.parentComponent):
+        profiles = _feature_profiles(feature)
+        if not profiles:
+            continue
+        keys, uses_gear = [], False
+        for p in profiles:
+            curves = _profile_curves(p)
+            if p.parentSketch == sketch and curves & gear_tokens:
+                uses_gear = True
+                keys.append(('gear', curves - gear_tokens))
+            else:
+                keys.append(('keep', curves, p))
+        if uses_gear:
+            captured.append(_Captured(feature, keys, _extent_settings(feature)))
+    return captured
+
+
+def _match(sketch: adsk.fusion.Sketch, key, new_gear_tokens: set):
+    """The one profile that corresponds to a captured profile key, or None.
+
+    Profiles are regenerated whenever the sketch changes, so even regions the gear doesn't touch
+    are found again by their bounding curves rather than reused.
+    """
+    kind, curves = key[0], key[1]
+    if kind == 'keep':
+        old = key[2]
+        # A profile of another sketch is unaffected by the edit. One of this sketch has gone
+        # stale (no longer valid), so look it up again below.
+        if old.isValid and old.parentSketch != sketch:
+            return old
+    matches = []
+    for i in range(sketch.profiles.count):
+        p = sketch.profiles.item(i)
+        found = _profile_curves(p)
+        if kind == 'keep':
+            if found == curves:
+                matches.append(p)
+        elif found & new_gear_tokens and (found - new_gear_tokens) == curves:
+            matches.append(p)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _set_profile(feature, profiles: list) -> None:
+    if len(profiles) == 1:
+        feature.profile = profiles[0]
+    else:
+        coll = adsk.core.ObjectCollection.create()
+        for p in profiles:
+            coll.add(p)
+        feature.profile = coll
+
+
+class _Repoint:
+    """Keeps features attached to a gear's regions while its curves are replaced.
+
+    Fusion's own handling can't be relied on. Once a feature's region loses its curves, the
+    reference is broken for good: the profile can be neither read nor set ("curProfile"). And a
+    feature that still looks healthy may have been re-attached to the wrong region, or lost one.
+
+    So: park() points every feature at a small temporary circle in the same sketch while the old
+    curves still exist. Features are handled last to first, so each is set while everything
+    before it still has its real geometry. The gear is then redrawn with the timeline marker
+    before those features. finish() points each feature, first to last, at its new regions
+    before the marker passes it, so nothing is ever computed with the temporary circle. Finally
+    the circle is deleted. A feature whose new regions can't be matched uniquely ends up with
+    Fusion's usual "profile missing" warning, as without this.
+    """
+
+    def __init__(self, sketch: adsk.fusion.Sketch, captured: list):
+        self.sketch = sketch
+        self.timeline = sketch.parentComponent.parentDesign.timeline
+        self.marker = self.timeline.markerPosition
+        self.items = sorted(captured, key=lambda c: c.feature.timelineObject.index)
+        self.temp = None
+        self.parked = []
+
+    def _temp_profile(self):
+        token = self.temp.entityToken
+        for i in range(self.sketch.profiles.count):
+            p = self.sketch.profiles.item(i)
+            if _profile_curves(p) == frozenset([token]):
+                return p
+        return None
+
+    def park(self) -> None:
+        repoint_errors.clear()
+        repoint_restored.clear()
+        try:
+            box = self.sketch.boundingBox
+            far = adsk.core.Point3D.create(box.maxPoint.x + 10.0, box.maxPoint.y + 10.0, 0)
+            self.temp = self.sketch.sketchCurves.sketchCircles.addByCenterRadius(far, 0.1)
+            for item in reversed(self.items):
+                item.feature.timelineObject.rollTo(True)
+                _set_profile(item.feature, [self._temp_profile()])
+                self.parked.append(item)
+        except Exception as e:
+            repoint_errors.append(f'parking failed: {e}')
+        # The gear is redrawn with the marker here: before the first parked feature.
+
+    def finish(self, new_gear_tokens: set) -> tuple:
+        """Point parked features at the redrawn gear's regions. Returns (re-pointed, not re-pointed) names."""
+        done, skipped = [], [item.feature.name for item in self.items if item not in self.parked]
+        try:
+            for item in self.items:
+                if item not in self.parked:
+                    continue
+                item.feature.timelineObject.rollTo(True)
+                profiles = [_match(self.sketch, key, new_gear_tokens) for key in item.keys]
+                if any(p is None for p in profiles):
+                    skipped.append(item.feature.name)
+                    repoint_errors.append(f'{item.feature.name}: no unique matching region')
+                    continue
+                try:
+                    _set_profile(item.feature, profiles)
+                    fixed = _restore_extent_settings(item.feature, item.settings)
+                    if fixed:
+                        repoint_restored.append(f'{item.feature.name}: {", ".join(fixed)}')
+                    done.append(item.feature.name)
+                except Exception as e:
+                    skipped.append(item.feature.name)
+                    repoint_errors.append(f'{item.feature.name}: {e}')
+        finally:
+            if self.marker >= self.timeline.count:
+                self.timeline.moveToEnd()
+            else:
+                self.timeline.markerPosition = self.marker
+            if self.temp is not None and self.temp.isValid:
+                self.temp.deleteMe()
+        return done, skipped
 
 
 def ring_trim_notes(radii: gm.Radii, pinions: tuple) -> list:

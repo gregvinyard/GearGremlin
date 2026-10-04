@@ -92,7 +92,9 @@ def run(context):
     check('no dependent warning when still aligned',
           not any('no longer lines up' in w for w in re1.warnings), str(re1.warnings))
     check('A record updated', abs(dr.read_gear(a).params.backlash - 0.15) < 1e-12)
-    check('extrude after edit', True, f'health={ext.healthState} error={ext.errorOrWarningMessage!r}')
+    check('extrude stays attached through the edit', re1.repointed == [ext.name] and
+          ext.healthState == adsk.fusion.FeatureHealthStates.HealthyFeatureHealthState,
+          f'{re1.repointed} health={ext.healthState} error={ext.errorOrWarningMessage[:60]!r}')
 
     # Rotate A by half a tooth: B no longer meshes.
     re2 = dr.make_gear(a, pa2, rotation_offset=pa2.angular_pitch / 2, finalize=True, edit=True)
