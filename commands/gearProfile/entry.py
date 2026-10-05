@@ -10,6 +10,7 @@ from ... import config
 from ... import gearmath as gm
 from ..common import inputs as ci
 from . import drawing
+from . import rack_drawing
 from . import settings
 
 app = adsk.core.Application.get()
@@ -17,11 +18,12 @@ ui = app.userInterface
 
 CMD_ID = f'{config.COMPANY_NAME}_{config.ADDIN_NAME}_gearProfile'
 CMD_NAME = 'GearGremlin'
-CMD_Description = 'Turn a sketch circle into an involute spur gear profile that meshes with its neighbours.'
+CMD_Description = ('Turn a sketch circle into an involute spur gear profile that meshes with its neighbours, '
+                   'or a sketch line into a rack.')
 
 EDIT_CMD_ID = f'{config.COMPANY_NAME}_{config.ADDIN_NAME}_gearEdit'
 EDIT_CMD_NAME = 'Edit Gear'
-EDIT_CMD_Description = "Change this gear's settings and redraw it."
+EDIT_CMD_Description = "Change this gear's (or rack's) settings and redraw it."
 
 IS_PROMOTED = False
 WORKSPACE_ID = 'FusionSolidEnvironment'
@@ -40,19 +42,30 @@ MESH = 'mesh_with'
 ROTATION = 'rotation'
 REFS = 'reference_circles'
 INFO = 'info'
+# Rack inputs, shown when the pitch selection is a line
+RESIZE_LINE = 'resize_line'
+FLIP = 'flip_side'
+OFFSET = 'rack_offset'
+BODY = 'rack_body'
+
+GEAR_ONLY = (GEAR_TYPE, TEETH, RESIZE, MESH, ROTATION, REFS)
+RACK_ONLY = (RESIZE_LINE, FLIP, OFFSET, BODY)
 
 TYPE_NAMES = {gm.EXTERNAL: 'External', gm.INTERNAL: 'Internal'}
 
 # Circle diameters (mm) as they were when the command started, keyed by entityToken.
 # Preview resizes circles, so reading them live while a preview is up could show the new size.
 _original_diameters = {}
+# Line lengths (mm) likewise, for racks.
+_original_lengths = {}
 
 # Last HTML written to each text box. Compared against this rather than the box's
 # formattedText, which Fusion may hand back reformatted.
 _last_text = {}
 
-# The gear being edited, or None when creating a new gear.
+# The gear (or rack) being edited, or None when creating one.
 _edit_circle: Optional[adsk.fusion.SketchCircle] = None
+_edit_line: Optional[adsk.fusion.SketchLine] = None
 
 _menu_handler = None
 
@@ -90,9 +103,9 @@ def stop():
 
 
 def marking_menu_displaying(args: adsk.core.MarkingMenuEventArgs):
-    """Offer "Edit Gear" when the right-clicked entity is a gear's circle or one of its curves."""
+    """Offer "Edit Gear" when the right-clicked entity is a gear's circle, a rack's line, or one of their curves."""
     entities = args.selectedEntities
-    is_gear = len(entities) == 1 and drawing.gear_for_entity(entities[0]) is not None
+    is_gear = len(entities) == 1 and rack_drawing.owner_for_entity(entities[0]) is not None
     controls = args.linearMarkingMenu.controls
     separator_id = EDIT_CMD_ID + '_separator'
     if not is_gear:
@@ -117,37 +130,50 @@ def _tip(cmd_input, text: str) -> None:
 
 
 def command_created(args: adsk.core.CommandCreatedEventArgs):
-    """Shared by GearGremlin and Edit Gear. A selected gear (circle or tooth) opens it for editing."""
-    global _edit_circle
+    """Shared by GearGremlin and Edit Gear. A selected gear or rack (its pitch curve or any of its
+    curves) opens it for editing."""
+    global _edit_circle, _edit_line
     futil.log(f'{CMD_NAME} Command Created Event')
     preselected = None
     _edit_circle = None
+    _edit_line = None
     record = None
+    rack_record = None
     if ui.activeSelections.count == 1:
         entity = ui.activeSelections.item(0).entity
-        _edit_circle = drawing.gear_for_entity(entity)
-        if _edit_circle is not None:
-            preselected = _edit_circle
+        owner = rack_drawing.owner_for_entity(entity)
+        if owner is not None and owner[0] == 'gear':
+            _edit_circle = preselected = owner[1]
             record = drawing.read_gear(_edit_circle)
+        elif owner is not None:
+            _edit_line = preselected = owner[1]
+            rack_record = rack_drawing.read_rack(_edit_line)
         else:
-            preselected = adsk.fusion.SketchCircle.cast(entity)
+            preselected = adsk.fusion.SketchCircle.cast(entity) or adsk.fusion.SketchLine.cast(entity)
 
     _original_diameters.clear()
+    _original_lengths.clear()
     _last_text.clear()
     _cache_diameters(preselected.parentSketch if preselected else
                      adsk.fusion.Sketch.cast(app.activeEditObject))
+    if adsk.fusion.SketchLine.cast(preselected):
+        _original_length(preselected)
 
     remembered = settings.load()
     if record is not None:
         remembered.update(_record_values(record))
+    if rack_record is not None:
+        remembered.update(_rack_record_values(rack_record))
     inputs = args.command.commandInputs
-    if record is not None:
+    if record is not None or rack_record is not None:
         args.command.okButtonText = 'Update'
 
-    pitch = inputs.addSelectionInput(PITCH, 'Pitch circle', 'Select the circle to turn into a gear')
+    pitch = inputs.addSelectionInput(PITCH, 'Pitch circle or line', 'Select a circle (gear) or a line (rack)')
     pitch.addSelectionFilter('SketchCircles')
+    pitch.addSelectionFilter('SketchLines')
     pitch.setSelectionLimits(1, 1)
-    _tip(pitch, 'The circle becomes the gear\'s pitch circle, where it touches the gear it meshes with.')
+    _tip(pitch, 'A circle becomes a gear\'s pitch circle; a line becomes a rack\'s pitch line, where it '
+                'touches the gear it meshes with.')
 
     gear_type = inputs.addDropDownCommandInput(GEAR_TYPE, 'Gear type', adsk.core.DropDownStyles.TextListDropDownStyle)
     for key, name in TYPE_NAMES.items():
@@ -165,6 +191,20 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     resize = inputs.addBoolValueInput(RESIZE, 'Resize circle to pitch diameter', True, '',
                                       remembered.get('resize', True))
     _tip(resize, 'Sets the circle to exactly module × teeth, so tangent gears stay correctly spaced.')
+
+    resize_line = inputs.addBoolValueInput(RESIZE_LINE, 'Resize line to whole teeth', True, '',
+                                           remembered.get('resize', True))
+    _tip(resize_line, 'Lengthens or shortens the line from its end so it holds a whole number of teeth.')
+    flip = inputs.addBoolValueInput(FLIP, 'Flip side', True, '', remembered.get('rack_flip', False))
+    _tip(flip, 'Puts the teeth on the other side of the line.')
+    offset = inputs.addValueInput(OFFSET, 'Offset along line', 'mm',
+                                  adsk.core.ValueInput.createByReal(remembered.get('rack_offset_mm', 0.0) / 10.0))
+    _tip(offset, 'Slides the teeth along the line.')
+    body_mm = remembered['rack_body_mm']
+    if body_mm < 0:
+        body_mm = 3.0 * remembered['module_mm']
+    body = inputs.addValueInput(BODY, 'Backing thickness', 'mm', adsk.core.ValueInput.createByReal(body_mm / 10.0))
+    _tip(body, 'Solid material below the tooth roots; 0 draws only the toothed edge.')
 
     mesh = inputs.addSelectionInput(MESH, 'Mesh with', 'Select a gear made by GearGremlin to line the teeth up with')
     mesh.addSelectionFilter('SketchCircles')
@@ -188,11 +228,17 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
         partner = drawing.find_gear_circle(_edit_circle.parentSketch, record.mesh_with)
         if partner is not None:
             mesh.addSelection(partner)
-    elif preselected and drawing.read_gear(preselected) is None:
+    elif rack_record is not None:
+        pitch.addSelection(_edit_line)
+        pitch.isEnabled = False
+    elif adsk.fusion.SketchCircle.cast(preselected) and drawing.read_gear(preselected) is None:
         pitch.addSelection(preselected)
         if not _apply_plan(inputs, preselected):
             _suggest_teeth(inputs)
         mesh.hasFocus = True
+    elif adsk.fusion.SketchLine.cast(preselected) and rack_drawing.owner_for_entity(preselected) is None:
+        pitch.addSelection(preselected)
+    _show_inputs_for(inputs)
     _sync_height(inputs)
 
     cmd = args.command
@@ -219,6 +265,23 @@ def _record_values(record: gm.GearRecord) -> dict:
         'resize': record.resize,
         'rotation': record.rotation_offset,
         'reference_circles': record.reference_circles,
+    }
+
+
+def _rack_record_values(record: gm.RackRecord) -> dict:
+    """Dialog values for editing an existing rack, in the same keys as remembered settings."""
+    params = record.params
+    return {
+        'module_mm': params.module,
+        'module_custom': params.module not in gm.STANDARD_MODULES_MM,
+        'pressure_angle_deg': round(math.degrees(params.pressure_angle), 6),
+        'height_factor': params.height_factor,
+        'height_custom': params.height_factor not in ci.HEIGHT_LABELS.values(),
+        'backlash_mm': params.backlash,
+        'resize': record.resize,
+        'rack_flip': record.side == gm.RIGHT,
+        'rack_offset_mm': record.offset,
+        'rack_body_mm': record.body,
     }
 
 
@@ -264,6 +327,9 @@ def _cache_diameters(sketch: Optional[adsk.fusion.Sketch]) -> None:
     for i in range(circles.count):
         c = circles.item(i)
         _original_diameters[c.entityToken] = 2 * drawing.circle_radius_mm(c)
+    # Lines aren't all measured here: a sketch holding a 400-tooth rack has ~1,600 lines, which
+    # takes over a second. The preselected line is measured at start; others when first selected,
+    # which happens with no preview up (see _original_length).
 
 
 def _original_diameter(circle: adsk.fusion.SketchCircle) -> float:
@@ -271,6 +337,15 @@ def _original_diameter(circle: adsk.fusion.SketchCircle) -> float:
     if token not in _original_diameters:
         _original_diameters[token] = 2 * drawing.circle_radius_mm(circle)
     return _original_diameters[token]
+
+
+def _original_length(line: adsk.fusion.SketchLine) -> float:
+    """The line's length before any preview resized it (see _original_diameters). First measured at
+    command start for a preselected line, else on the selection change that picked it."""
+    token = line.entityToken
+    if token not in _original_lengths:
+        _original_lengths[token] = rack_drawing.line_frame(line)[2]
+    return _original_lengths[token]
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +357,44 @@ def _selected_circle(inputs, input_id: str) -> Optional[adsk.fusion.SketchCircle
     if sel.selectionCount == 0:
         return None
     return adsk.fusion.SketchCircle.cast(sel.selection(0).entity)
+
+
+def _selected_line(inputs) -> Optional[adsk.fusion.SketchLine]:
+    """The pitch selection when it's a line (a rack), else None."""
+    sel: adsk.core.SelectionCommandInput = inputs.itemById(PITCH)
+    if sel.selectionCount == 0:
+        return None
+    return adsk.fusion.SketchLine.cast(sel.selection(0).entity)
+
+
+def _show_inputs_for(inputs) -> None:
+    """Show the rack inputs when the pitch selection is a line, the gear inputs otherwise."""
+    rack = _selected_line(inputs) is not None
+    for input_id in GEAR_ONLY:
+        inputs.itemById(input_id).isVisible = not rack
+    for input_id in RACK_ONLY:
+        inputs.itemById(input_id).isVisible = rack
+
+
+def _rack_params(inputs) -> gm.RackParams:
+    return gm.RackParams(
+        module=ci.module_mm(inputs),
+        pressure_angle=ci.pressure_rad(inputs),
+        backlash=ci.backlash_mm(inputs),
+        height_factor=ci.height_factor(inputs),
+    )
+
+
+def _rack_side(inputs) -> int:
+    return gm.RIGHT if inputs.itemById(FLIP).value else gm.LEFT
+
+
+def _rack_offset_mm(inputs) -> float:
+    return inputs.itemById(OFFSET).value * 10.0   # cm → mm
+
+
+def _rack_body_mm(inputs) -> float:
+    return inputs.itemById(BODY).value * 10.0     # cm → mm
 
 
 def _gear_type(inputs) -> str:
@@ -301,6 +414,9 @@ def _params(inputs) -> gm.GearParams:
 
 
 def _partner_record(inputs) -> Optional[gm.GearRecord]:
+    """The Mesh with partner's record. None for a rack, which has no Mesh with (yet)."""
+    if _selected_line(inputs) is not None:
+        return None
     partner = _selected_circle(inputs, MESH)
     return drawing.read_gear(partner) if partner is not None else None
 
@@ -322,6 +438,13 @@ def _sync_height(inputs) -> None:
 
 
 def _update_height_note(inputs) -> None:
+    if _selected_line(inputs) is not None:
+        try:
+            note = ci.rack_height_note(_rack_params(inputs))
+        except Exception:
+            note = ''
+        _set_text(inputs, ci.HEIGHT_NOTE, f'<span style="color:#707070">{note}</span>' if note else '')
+        return
     try:
         params = _params(inputs)
     except Exception:
@@ -343,9 +466,11 @@ def _update_height_note(inputs) -> None:
 def _pre_check(inputs) -> gm.Check:
     """Checks that don't need the sketch modified: everything validateInputs can know."""
     check = gm.Check()
+    if _selected_line(inputs) is not None:
+        return _pre_check_rack(inputs)
     circle = _selected_circle(inputs, PITCH)
     if circle is None:
-        check.errors.append('Select a circle.')
+        check.errors.append('Select a circle or a line.')
         return check
     params = _params(inputs)
     check.extend(gm.check_params(params))
@@ -384,9 +509,65 @@ def _pre_check(inputs) -> gm.Check:
     return check
 
 
-def _info_html(inputs, errors: list, warnings: list, infos: list, radii: Optional[gm.Radii]) -> str:
+def _pre_check_rack(inputs) -> gm.Check:
+    """_pre_check for a line: the rack checks that don't need the sketch modified."""
+    check = gm.Check()
+    line = _selected_line(inputs)
+    error = rack_drawing.in_plane_error(line)
+    if error:
+        check.errors.append(error)
+        return check
+    resize = inputs.itemById(RESIZE_LINE).value
+    check.extend(gm.check_rack(_rack_params(inputs), _original_length(line), resize,
+                               _rack_offset_mm(inputs), _rack_body_mm(inputs)))
+    if check.errors:
+        return check
+    if line == _edit_line:
+        if rack_drawing.read_rack(line) is None:
+            check.errors.append("This line isn't a rack made by this tool.")
+            return check
+        check.infos.append('Extrudes and revolves made from this rack are re-pointed to the new profile on Update.')
+    elif rack_drawing.read_rack(line) is not None:
+        check.errors.append('This line is already a rack. Pick a different line.')
+        return check
+    elif rack_drawing.owner_for_entity(line) is not None:
+        check.errors.append('That line is part of a gear made by this tool.')
+        return check
+    if resize:
+        error = rack_drawing.line_resize_check(line)
+        if error:
+            check.errors.append(error)
+        warning = rack_drawing.length_expression_warning(line)
+        if warning:
+            check.warnings.append(warning)
+    return check
+
+
+def _rack_summary(inputs, rack: Optional[gm.RackProfile]) -> str:
+    """'Line 48.00 mm → 50.27 mm (+2.27 mm), 8 teeth, pitch 6.28 mm', from the drawn rack if there is one."""
+    line = _selected_line(inputs)
+    params = _rack_params(inputs)
+    if params.module <= 0:
+        return ''
+    l0 = _original_length(line)
+    if rack is not None:
+        length, teeth = rack.length, len(rack.tooth_centers)
+    else:
+        resize = inputs.itemById(RESIZE_LINE).value
+        length = gm.rack_teeth_for_length(l0, params) * params.pitch if resize else l0
+        teeth = len(gm.rack_tooth_centers(length, params, _rack_offset_mm(inputs)))
+    change = f'{l0:.2f} mm → {length:.2f} mm ({length - l0:+.2f} mm)' if abs(length - l0) > 5e-3 else f'{l0:.2f} mm'
+    return f'Line {change}, {teeth} teeth, pitch {params.pitch:.2f} mm'
+
+
+def _info_html(inputs, errors: list, warnings: list, infos: list, radii: Optional[gm.Radii],
+               rack: Optional[gm.RackProfile] = None) -> str:
     lines = []
     circle = _selected_circle(inputs, PITCH)
+    if _selected_line(inputs) is not None:
+        summary = _rack_summary(inputs, rack)
+        if summary:
+            lines.append(summary)
     module = ci.module_mm(inputs)
     if circle is not None and module > 0:
         params = _params(inputs)
@@ -410,8 +591,9 @@ def _set_text(inputs, input_id: str, html: str) -> None:
         inputs.itemById(input_id).formattedText = html
 
 
-def _set_info(inputs, errors: list, warnings: list, infos: list = (), radii: Optional[gm.Radii] = None) -> None:
-    _set_text(inputs, INFO, _info_html(inputs, errors, warnings, list(infos), radii))
+def _set_info(inputs, errors: list, warnings: list, infos: list = (), radii: Optional[gm.Radii] = None,
+              rack: Optional[gm.RackProfile] = None) -> None:
+    _set_text(inputs, INFO, _info_html(inputs, errors, warnings, list(infos), radii, rack))
 
 
 # ---------------------------------------------------------------------------
@@ -422,6 +604,20 @@ def _run(inputs, finalize: bool) -> drawing.GearResult:
     check = _pre_check(inputs)
     if check.errors:
         result = drawing.GearResult(errors=check.errors, warnings=check.warnings, infos=check.infos)
+    elif _selected_line(inputs) is not None:
+        result = rack_drawing.make_rack(
+            _selected_line(inputs),
+            _rack_params(inputs),
+            side=_rack_side(inputs),
+            offset=_rack_offset_mm(inputs),
+            body=_rack_body_mm(inputs),
+            resize=inputs.itemById(RESIZE_LINE).value,
+            finalize=finalize,
+            edit=_edit_line is not None,
+        )
+        # make_rack repeats check_rack's warnings; keep one copy of each.
+        result.warnings = list(dict.fromkeys(check.warnings + result.warnings))
+        result.infos = check.infos + result.infos
     else:
         result = drawing.make_gear(
             _selected_circle(inputs, PITCH),
@@ -436,7 +632,7 @@ def _run(inputs, finalize: bool) -> drawing.GearResult:
         result.warnings = check.warnings + result.warnings
         result.infos = check.infos + result.infos
     radii = result.profile.radii if result.profile is not None else None
-    _set_info(inputs, result.errors, result.warnings, result.infos, radii)
+    _set_info(inputs, result.errors, result.warnings, result.infos, radii, result.rack)
     return result
 
 
@@ -448,18 +644,22 @@ def command_execute(args: adsk.core.CommandEventArgs):
         args.executeFailed = True
         args.executeFailedMessage = '\n'.join(result.errors)
         return
-    if _edit_circle is not None:
+    if _edit_circle is not None or _edit_line is not None:
+        what = 'gear' if _edit_circle is not None else 'rack'
         if drawing.repoint_restored:
             futil.log_to_file('Settings restored after re-pointing: ' + '; '.join(drawing.repoint_restored))
         if drawing.repoint_errors:
-            futil.log_to_file('Re-pointing features after editing a gear: ' + '; '.join(drawing.repoint_errors))
+            futil.log_to_file(f'Re-pointing features after editing a {what}: ' + '; '.join(drawing.repoint_errors))
         if result.not_repointed:
-            ui.messageBox('The gear was updated, but these features couldn\'t be re-pointed to its new profile: '
+            ui.messageBox(f'The {what} was updated, but these features couldn\'t be re-pointed to its new profile: '
                           f'{", ".join(result.not_repointed)}.\n\nEdit each one and reselect its profile.',
                           CMD_NAME)
         return  # editing one gear shouldn't change the defaults for new gears
     values = ci.remembered_values(inputs)
-    values['gear_type'] = _gear_type(inputs)
+    if _selected_line(inputs) is not None:
+        values['rack_body_mm'] = _rack_body_mm(inputs)
+    else:
+        values['gear_type'] = _gear_type(inputs)
     settings.save(values)
 
 
@@ -473,6 +673,11 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     inputs = args.inputs
     futil.log(f'{CMD_NAME} Input Changed Event fired from a change to {changed.id}')
     ci.on_changed(inputs, changed.id)
+    if changed.id == PITCH:
+        line = _selected_line(inputs)
+        if line is not None:
+            _original_length(line)
+        _show_inputs_for(inputs)
     planned = False
     if changed.id == PITCH and _edit_circle is None:
         circle = _selected_circle(inputs, PITCH)
@@ -498,8 +703,21 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
 
 
 def command_pre_select(args: adsk.core.SelectionEventArgs):
-    """Pitch circle accepts only circles that aren't gears yet; Mesh with accepts only gears."""
+    """Pitch accepts circles that aren't gears yet and lines that aren't racks or part of a gear or
+    rack outline; Mesh with accepts only gears."""
     if args.activeInput is None or args.activeInput.id not in (PITCH, MESH):
+        return
+    line = adsk.fusion.SketchLine.cast(args.selection.entity)
+    if line is not None:
+        # Cheap checks first: preSelect fires on every hover.
+        if args.activeInput.id == MESH:
+            args.isSelectable = False
+        elif line.attributes.itemByName(drawing.ATTR_GROUP, drawing.PART_NAME) is not None:
+            args.isSelectable = False
+        elif rack_drawing.read_rack(line) is not None:
+            args.isSelectable = line == _edit_line
+        else:
+            args.isSelectable = rack_drawing.rack_for_entity(line) is None
         return
     circle = adsk.fusion.SketchCircle.cast(args.selection.entity)
     is_gear = circle is not None and drawing.read_gear(circle) is not None
@@ -511,8 +729,10 @@ def command_pre_select(args: adsk.core.SelectionEventArgs):
 
 def command_destroy(args: adsk.core.CommandEventArgs):
     futil.log(f'{CMD_NAME} Command Destroy Event')
-    global local_handlers, _edit_circle
+    global local_handlers, _edit_circle, _edit_line
     local_handlers = []
     _last_text.clear()
     _edit_circle = None
+    _edit_line = None
     _original_diameters.clear()
+    _original_lengths.clear()

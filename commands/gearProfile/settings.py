@@ -13,6 +13,7 @@ DEFAULTS = {
     'backlash_mm': 0.05,
     'height_factor': 1.0,
     'height_custom': False,
+    'rack_body_mm': -1.0,   # racks' backing thickness; below 0 means 3 × module
 }
 
 _current = None

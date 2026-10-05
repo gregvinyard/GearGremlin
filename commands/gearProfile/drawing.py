@@ -353,8 +353,9 @@ def _closer(pt_a: adsk.fusion.SketchPoint, pt_b: adsk.fusion.SketchPoint, target
     return pt_a if dist(pt_a) <= dist(pt_b) else pt_b
 
 
-def draw_profile(sketch: adsk.fusion.Sketch, profile: gm.Profile) -> list:
-    """Draw the profile as one closed loop, chaining shared SketchPoints. Returns the new curves."""
+def draw_profile(sketch: adsk.fusion.Sketch, profile, closed: bool = True) -> list:
+    """Draw a profile's segments (a gear Profile or a RackProfile) as one chain of shared SketchPoints,
+    closed into a loop unless `closed` is False. Returns the new curves."""
     curves = sketch.sketchCurves
     segments = profile.segments
     entities = []
@@ -366,7 +367,7 @@ def draw_profile(sketch: adsk.fusion.Sketch, profile: gm.Profile) -> list:
         last = len(segments) - 1
         for i, seg in enumerate(segments):
             start = prev_point if prev_point is not None else p3(seg.start)
-            end = first_point if i == last else p3(seg.end)
+            end = first_point if i == last and closed else p3(seg.end)
             if isinstance(seg, gm.Line):
                 ent = curves.sketchLines.addByTwoPoints(start, end)
             elif isinstance(seg, gm.Arc):
@@ -408,6 +409,7 @@ class GearResult:
     warnings: list = field(default_factory=list)
     infos: list = field(default_factory=list)
     profile: Optional[gm.Profile] = None
+    rack: Optional[gm.RackProfile] = None                # set instead of profile when a rack was drawn
     theta0: float = 0.0
     entities: list = field(default_factory=list)
     repointed: list = field(default_factory=list)       # feature names kept attached through an edit

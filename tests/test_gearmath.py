@@ -645,3 +645,281 @@ def test_to_svg_writes_file():
     gm.to_svg([gm.build_profile(ext(12)), gm.build_profile(ring(40))], out)
     with open(out, encoding='utf-8') as f:
         assert f.read().startswith('<svg')
+
+
+# --- racks -----------------------------------------------------------------
+
+def rack(m: float = 2.0, alpha: float = DEG20, backlash: float = 0.0, k: float = 1.0) -> gm.RackParams:
+    return gm.RackParams(m, alpha, backlash, k)
+
+
+RACKS = [rack(), rack(backlash=B), rack(1.0, math.radians(14.5), 0.1), rack(3.0, math.radians(25), B),
+         rack(k=0.8), rack(k=1.25), rack(1.5, math.radians(25), 0.0, 1.3)]
+
+
+def _points_of(segments):
+    return [p for seg in segments for p in (seg.start, seg.end)]
+
+
+@pytest.mark.parametrize('n', [1, 5, 12])
+def test_rack_teeth_for_length(n):
+    p = rack().pitch
+    assert gm.rack_teeth_for_length(n * p, rack()) == n
+    assert gm.rack_teeth_for_length(n * p - 0.01, rack()) == n
+    assert gm.rack_teeth_for_length(n * p + 0.01, rack()) == n
+    assert gm.rack_teeth_for_length((n + 0.5) * p - 1e-6, rack()) == n
+    assert gm.rack_teeth_for_length((n + 0.5) * p + 1e-6, rack()) == n + 1
+
+
+def test_rack_teeth_for_length_is_at_least_one():
+    assert gm.rack_teeth_for_length(0.1, rack()) == 1
+
+
+def test_rack_tooth_centers():
+    params = rack()
+    p = params.pitch
+    assert gm.rack_tooth_centers(5 * p, params) == pytest.approx([p / 2 + i * p for i in range(5)])
+    assert gm.rack_tooth_centers(5 * p, params, p) == pytest.approx(gm.rack_tooth_centers(5 * p, params))
+    assert gm.rack_tooth_centers(5 * p, params, -2 * p) == pytest.approx(gm.rack_tooth_centers(5 * p, params))
+    shifted = gm.rack_tooth_centers(5 * p, params, 0.3)
+    assert len(shifted) == 4
+    for s in shifted + gm.rack_tooth_centers(7.3 * p, params, -1.1):
+        assert -1e-9 <= s - p / 2 and s + p / 2 <= 7.3 * p + 1e-9
+    assert gm.rack_tooth_centers(0.9 * p, params) == []
+
+
+def test_rack_offset_shifts_pattern_by_offset_mod_pitch():
+    params = rack()
+    p = params.pitch
+    base = gm.rack_tooth_centers(10 * p, params)
+    for offset in (0.4, -0.4, 2.5 * p + 0.1):
+        moved = gm.rack_tooth_centers(10 * p, params, offset)
+        shift = offset % p
+        assert moved
+        for s in moved:
+            assert min(abs((s - shift) - b) for b in base) < 1e-9
+
+
+@pytest.mark.parametrize('params', RACKS)
+def test_rack_tooth_width_at_pitch_line(params):
+    """p/2 − B/2: each part of a mesh takes half the backlash, as gear teeth do."""
+    segs = gm.rack_local_segments(params, 3 * params.pitch)
+    crossings = sorted(seg.start[0] + (seg.end[0] - seg.start[0]) * (0 - seg.start[1]) / (seg.end[1] - seg.start[1])
+                       for seg in segs if isinstance(seg, gm.Line) and min(seg.start[1], seg.end[1]) < 0
+                       < max(seg.start[1], seg.end[1]))
+    assert len(crossings) == 6
+    for left, right in zip(crossings[0::2], crossings[1::2]):
+        assert right - left == pytest.approx(params.pitch / 2 - params.backlash / 2, abs=1e-9)
+
+
+@pytest.mark.parametrize('params', RACKS)
+def test_rack_tip_and_root_heights(params):
+    pts = _points_of(gm.rack_local_segments(params, 4 * params.pitch))
+    assert max(h for _, h in pts) == pytest.approx(params.height_factor * params.module, abs=1e-12)
+    assert min(h for _, h in pts) == pytest.approx(-(params.height_factor + 0.25) * params.module, abs=1e-12)
+
+
+def test_rack_space_is_the_gear_cutter():
+    params = rack(k=0.8, backlash=B)
+    gear = gm.GearParams(params.module, 30, params.pressure_angle, params.backlash, gm.EXTERNAL, 0.8)
+    assert gm.rack_cutter(params) == gm.cutter(gear)
+
+
+def test_cutter_values_unchanged_by_refactor():
+    c = gm.cutter(ext(20, backlash=B))   # values from the code before _cutter was split out
+    assert (c.depth, c.half_width) == pytest.approx((2.5, math.pi / 2 + B / 4))
+    assert c.corner_radius == pytest.approx(0.76)
+    assert c.corner_x == pytest.approx(math.pi / 2 + B / 4 - (2.5 - 0.76) * math.tan(DEG20) - 0.76 / math.cos(DEG20))
+    assert c.straight_depth == pytest.approx(2.5 - 0.76 * (1 - math.sin(DEG20)))
+
+
+@pytest.mark.parametrize('params', RACKS)
+def test_rack_flank_angle_equals_pressure_angle(params):
+    flanks = [s for s in gm.rack_local_segments(params, 3 * params.pitch)
+              if isinstance(s, gm.Line) and abs(s.end[1] - s.start[1]) > 1e-9]
+    assert len(flanks) == 6
+    for f in flanks:
+        dx, dh = f.end[0] - f.start[0], f.end[1] - f.start[1]
+        assert math.atan2(abs(dx), abs(dh)) == pytest.approx(params.pressure_angle, abs=1e-12)
+
+
+def _direction(seg, at_end: bool):
+    """Unit direction of travel at the segment's start or end."""
+    if isinstance(seg, gm.Arc):
+        angle = seg.start_angle + (seg.sweep if at_end != seg.clockwise else 0.0)
+        sign = -1.0 if seg.clockwise else 1.0
+        return (-sign * math.sin(angle), sign * math.cos(angle))
+    dx, dy = seg.end[0] - seg.start[0], seg.end[1] - seg.start[1]
+    n = math.hypot(dx, dy)
+    return dx / n, dy / n
+
+
+@pytest.mark.parametrize('params', RACKS)
+@pytest.mark.parametrize('side', [gm.LEFT, gm.RIGHT])
+def test_rack_fillets_are_tangent(params, side):
+    prof = gm.build_rack(params, (1.0, 2.0), 0.8, side, 4 * params.pitch, 0.7)
+    segs = prof.segments
+    cut = gm.rack_cutter(params)
+    arcs = 0
+    for i, seg in enumerate(segs):
+        if not isinstance(seg, gm.Arc):
+            continue
+        arcs += 1
+        assert seg.radius == pytest.approx(cut.corner_radius)
+        before, after = segs[i - 1], segs[i + 1]
+        assert _direction(before, True) == pytest.approx(_direction(seg, False), abs=1e-9)
+        assert _direction(seg, True) == pytest.approx(_direction(after, False), abs=1e-9)
+        depths = sorted(-prof_h for prof_h in (gm.rack_coords(prof.origin, prof.direction, side, seg.start)[1],
+                                              gm.rack_coords(prof.origin, prof.direction, side, seg.end)[1]))
+        assert depths[0] == pytest.approx(cut.straight_depth, abs=1e-12)   # flank end of the fillet
+        assert depths[1] == pytest.approx(cut.depth, abs=1e-12)            # root end
+    assert arcs == 2 * len(prof.tooth_centers)
+
+
+def test_rack_full_round_root():
+    params = rack(alpha=math.radians(25))
+    assert gm.rack_cutter(params).corner_x == pytest.approx(0, abs=1e-12)
+    segs = gm.rack_local_segments(params, 3 * params.pitch)
+    roots = [s for s in segs if isinstance(s, gm.Line) and abs(s.start[1] - s.end[1]) < 1e-12 and s.start[1] < 0]
+    assert roots == []  # the arcs meet at each space center; no flat root (offset 0, L = N·p)
+    for a, b in zip(segs, segs[1:]):
+        assert a.end == pytest.approx(b.start, abs=1e-9)
+
+
+@pytest.mark.parametrize('params', RACKS)
+@pytest.mark.parametrize('offset', [0.0, 1.3, -0.4])
+def test_rack_edge_is_continuous_and_closes_with_body(params, offset):
+    L = 6.4 * params.pitch
+    hf = params.dedendum
+    edge = gm.rack_local_segments(params, L, offset)
+    assert edge[0].start == pytest.approx((0.0, -hf), abs=1e-12)
+    assert edge[-1].end == pytest.approx((L, -hf), abs=1e-12)
+    for body in (0.0, 5.0):
+        segs = gm.rack_local_segments(params, L, offset, body)
+        pairs = list(zip(segs, segs[1:])) + ([(segs[-1], segs[0])] if body else [])
+        for a, b in pairs:
+            assert a.end == pytest.approx(b.start, abs=1e-9)
+    root_lines = [s for s in edge if isinstance(s, gm.Line) and abs(s.start[1] - s.end[1]) < 1e-12
+                  and abs(s.start[1] + hf) < 1e-12]
+    for a, b in zip(root_lines, root_lines[1:]):
+        assert b.start[0] > a.end[0] + 1e-9  # root runs are merged, never split into collinear pieces
+
+
+@pytest.mark.parametrize('direction_deg', [0, 30, 90, 137, 180, -60])
+def test_rack_placement_and_sides(direction_deg):
+    params = rack(backlash=B)
+    origin, direction, L = (12.0, -5.0), math.radians(direction_deg), 5.2 * params.pitch
+    local = gm.rack_local_segments(params, L, 0.5, 4.0)
+    left = gm.build_rack(params, origin, direction, gm.LEFT, L, 0.5, 4.0)
+    right = gm.build_rack(params, origin, direction, gm.RIGHT, L, 0.5, 4.0)
+    u = (math.cos(direction), math.sin(direction))
+    for loc, a, b in zip(local, left.segments, right.segments):
+        for (s, h), pa, pb in ((loc.start, a.start, b.start), (loc.end, a.end, b.end)):
+            assert pa == pytest.approx((origin[0] + s * u[0] - h * u[1], origin[1] + s * u[1] + h * u[0]), abs=1e-9)
+            assert pb == pytest.approx((origin[0] + s * u[0] + h * u[1], origin[1] + s * u[1] - h * u[0]), abs=1e-9)
+            assert gm.rack_coords(origin, direction, gm.RIGHT, pb) == pytest.approx((s, h), abs=1e-9)
+        if isinstance(loc, gm.Arc):
+            assert a.mid == pytest.approx(gm.rack_point(origin, direction, gm.LEFT, *loc.mid), abs=1e-9)
+            assert b.mid == pytest.approx(gm.rack_point(origin, direction, gm.RIGHT, *loc.mid), abs=1e-9)
+    for prof, side in ((left, 1), (right, -1)):
+        tip = prof.point(prof.tooth_centers[0], params.addendum)
+        cross = u[0] * (tip[1] - origin[1]) - u[1] * (tip[0] - origin[0])
+        assert cross * side > 0  # teeth on the chosen side of start → end
+        segs = prof.segments
+        for a, b in zip(segs, segs[1:] + segs[:1]):
+            assert a.end == pytest.approx(b.start, abs=1e-9)
+
+
+def _rack_area(params: gm.RackParams, L: float, offset: float, body: float) -> float:
+    """Independent area count: the strip under the roots plus, per tooth, its cell minus the two
+    half-spaces (trapezoids up to the tip, less the material each root fillet adds)."""
+    a, hf, alpha, p = params.addendum, params.dedendum, params.pressure_angle, params.pitch
+    w = p / 4 + params.backlash / 4
+    rho = gm.rack_cutter(params).corner_radius
+    gamma = math.pi / 2 + alpha                     # air-side angle between root line and flank
+    fillet = rho * rho * (1 / math.tan(gamma / 2) - (math.pi - gamma) / 2)
+    half_space = w * (a + hf) + math.tan(alpha) * (a * a - hf * hf) / 2 - fillet
+    tooth = p * (a + hf) - 2 * half_space
+    return L * body + tooth * len(gm.rack_tooth_centers(L, params, offset))
+
+
+@pytest.mark.parametrize('params', RACKS)
+def test_rack_area(params):
+    L, offset, body = 7.7 * params.pitch, 0.9, 3 * params.module
+    expected = _rack_area(params, L, offset, body)
+    for side in (gm.LEFT, gm.RIGHT):
+        for direction in (0.0, 2.1):
+            prof = gm.build_rack(params, (4.0, 9.0), direction, side, L, offset, body)
+            assert abs(gm.profile_area(prof.segments)) == pytest.approx(expected, rel=1e-12)
+
+
+def test_profile_area_of_circle_and_square():
+    assert gm.profile_area([gm.Arc((1.0, 2.0), 3.0, 0.3, 2 * math.pi)]) == pytest.approx(math.pi * 9)
+    assert gm.profile_area([gm.Arc((1.0, 2.0), 3.0, 0.3, 2 * math.pi, True)]) == pytest.approx(-math.pi * 9)
+    square = [gm.Line((0, 0), (2, 0)), gm.Line((2, 0), (2, 2)), gm.Line((2, 2), (0, 2)), gm.Line((0, 2), (0, 0))]
+    assert gm.profile_area(square) == pytest.approx(4.0)
+
+
+@pytest.mark.parametrize('params', [rack(), rack(backlash=0.2), rack(alpha=math.radians(14.5)),
+                                    rack(1.0, math.radians(25), B)])
+def test_rack_factor_max(params):
+    k_max = gm.rack_factor_max(params)
+    at_max = gm.RackParams(params.module, params.pressure_angle, params.backlash, k_max)
+    assert gm.rack_top_land(at_max) >= gm.MIN_TOP_LAND * params.module - 1e-9
+    assert gm.rack_cutter(at_max).valid
+    above = gm.RackParams(params.module, params.pressure_angle, params.backlash, k_max + 0.001)
+    if k_max < gm.FACTOR_CAP:
+        assert gm.rack_top_land(above) < gm.MIN_TOP_LAND * params.module or not gm.rack_cutter(above).valid
+    assert gm.check_rack(at_max, 50, True).ok
+    assert not gm.check_rack(above, 50, True).ok
+
+
+def test_rack_factor_max_is_where_top_land_reaches_its_minimum_at_20_degrees():
+    at_max = gm.RackParams(2.0, DEG20, 0.0, gm.rack_factor_max(rack()))
+    assert gm.rack_top_land(at_max) == pytest.approx(gm.MIN_TOP_LAND * 2.0, abs=1e-3)
+
+
+def test_check_rack():
+    p = rack().pitch
+    assert gm.check_rack(rack(), 10 * p, True).ok
+    assert 'shorter than one tooth' in gm.check_rack(rack(), 0.9 * p, False).errors[0]
+    assert gm.check_rack(rack(), 0.9 * p, True).ok          # resize makes it one tooth long
+    assert 'at this offset' in gm.check_rack(rack(), 0.9 * p, True, offset=0.5).errors[0]
+    assert 'at most' in gm.check_rack(rack(), 401 * p, True).errors[0]
+    assert 'Backlash' in gm.check_rack(rack(backlash=p / 2), 50, True).errors[0]
+    assert 'negative' in gm.check_rack(rack(backlash=-0.1), 50, True).errors[0]
+    assert 'Backing' in gm.check_rack(rack(), 50, True, body=-1).errors[0]
+    assert 'minimum' in gm.check_rack(rack(k=0.5), 50, True).errors[0]
+    assert 'no length' in gm.check_rack(rack(), 0, True).errors[0]
+    leftover = gm.check_rack(rack(), 10.5 * p, False)
+    assert leftover.ok and 'has no teeth' in leftover.warnings[0]
+    assert not gm.check_rack(rack(), 10 * p, False).warnings
+
+
+def test_rack_attribute_roundtrip():
+    params = gm.RackParams(2.5, math.radians(14.5), 0.1, 0.8)
+    record = gm.RackRecord(params, 'r1', gm.RIGHT, 1.25, False, 7.5, 11, (3.0, -4.0), 0.7, 86.4, 'g9')
+    parsed = gm.from_rack_attribute(gm.to_rack_attribute(record))
+    assert parsed is not None
+    assert parsed.params.module == 2.5 and parsed.params.backlash == 0.1 and parsed.params.height_factor == 0.8
+    assert parsed.params.pressure_angle == pytest.approx(params.pressure_angle)
+    assert (parsed.rack_id, parsed.side, parsed.offset, parsed.resize, parsed.body, parsed.teeth) == \
+        ('r1', gm.RIGHT, 1.25, False, 7.5, 11)
+    assert (parsed.origin, parsed.direction, parsed.length, parsed.mesh_with) == ((3.0, -4.0), 0.7, 86.4, 'g9')
+    for bad in ('not json', '[1, 2]', '{"version": 1}', '{"id": "x", "side": 3}'):
+        assert gm.from_rack_attribute(bad) is None
+    assert gm.from_rack_attribute(gm.to_attribute(gm.GearRecord(ext(20), 0.0, 'g1'))) is None
+    assert gm.from_attribute(gm.to_rack_attribute(record)) is None
+
+
+def test_rack_svgs():
+    out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'out')
+    os.makedirs(out_dir, exist_ok=True)
+    params = rack(backlash=B)
+    for name, side in (('left', gm.LEFT), ('right', gm.RIGHT)):
+        out = os.path.join(out_dir, f'rack_{name}.svg')
+        gm.to_svg(gm.build_rack(params, (0.0, 0.0), math.radians(30), side, 6 * params.pitch, 0.0, 6.0), out)
+        with open(out, encoding='utf-8') as f:
+            assert f.read().startswith('<svg')
+    out = os.path.join(out_dir, 'rack_open_offset.svg')
+    gm.to_svg(gm.build_rack(rack(alpha=math.radians(25)), (0.0, 0.0), 0.0, gm.LEFT, 6 * params.pitch, 1.5), out)

@@ -169,9 +169,12 @@ class Cutter:
 
 
 def cutter(params: GearParams) -> Cutter:
-    m, a = params.module, params.pressure_angle
-    hf = params.dedendum
-    w = math.pi * m / 4.0 + params.backlash / 4.0
+    return _cutter(params.module, params.pressure_angle, params.dedendum, params.backlash)
+
+
+def _cutter(m: float, a: float, hf: float, backlash: float) -> Cutter:
+    """The cutter for module m, pressure angle a, depth hf and backlash (shared by gears and racks)."""
+    w = math.pi * m / 4.0 + backlash / 4.0
     tip_half = w - hf * math.tan(a)
     if tip_half <= 0.0:
         return Cutter(hf, 0.0, w, 0.0, hf, hf, False)
@@ -757,11 +760,15 @@ class Spline:
 
 @dataclass(frozen=True)
 class Arc:
-    """Counter-clockwise arc from start_angle sweeping `sweep` (> 0) radians."""
+    """The arc from start_angle sweeping `sweep` (> 0) radians counter-clockwise.
+
+    With `clockwise`, the same arc is traversed the other way: start and end swap.
+    """
     center: Point
     radius: float
     start_angle: float
     sweep: float
+    clockwise: bool = False
 
     def point_at(self, angle: float) -> Point:
         return (self.center[0] + self.radius * math.cos(angle),
@@ -769,7 +776,7 @@ class Arc:
 
     @property
     def start(self) -> Point:
-        return self.point_at(self.start_angle)
+        return self.point_at(self.start_angle + (self.sweep if self.clockwise else 0.0))
 
     @property
     def mid(self) -> Point:
@@ -777,7 +784,7 @@ class Arc:
 
     @property
     def end(self) -> Point:
-        return self.point_at(self.start_angle + self.sweep)
+        return self.point_at(self.start_angle + (0.0 if self.clockwise else self.sweep))
 
 
 Segment = Union[Line, Spline, Arc]
@@ -1348,39 +1355,364 @@ def suggest_planetary(module: float, pressure_angle: float, k: float, backlash: 
 
 
 # ---------------------------------------------------------------------------
+# Racks
+# ---------------------------------------------------------------------------
+#
+# A rack is drawn along a pitch line from S (the line's start) in direction u. Rack coordinates
+# (s, h): s along the line from S, h above the pitch line toward the tooth tips. The teeth are on
+# the left of u for side = LEFT (+1), on the right for side = RIGHT (−1): n = side · (−u_y, u_x),
+# and (s, h) maps to S + s·u + h·n. See docs/rack-spec.md.
+#
+# Tooth phase: tooth i is centred at s_i = p/2 + offset + i·p, so with offset 0 the line's start is
+# at the center of a tooth space. A tooth is drawn only if its whole cell [s_i − p/2, s_i + p/2]
+# (space center to space center) lies on [0, L]; elsewhere the edge runs along the root line.
+#
+# Backlash: as for gears, B is the total per mesh and each part takes half. A rack tooth is
+# p/2 − B/2 wide at the pitch line, so its space is exactly the gear cutter's tooth (_cutter).
+
+LEFT = 1
+RIGHT = -1
+RACK_ATTR_VERSION = 1
+
+
+@dataclass(frozen=True)
+class RackParams:
+    module: float
+    pressure_angle: float  # radians
+    backlash: float = 0.0  # total per mesh, mm
+    height_factor: float = 1.0
+
+    @property
+    def pitch(self) -> float:
+        return math.pi * self.module
+
+    @property
+    def addendum(self) -> float:
+        return self.height_factor * self.module
+
+    @property
+    def dedendum(self) -> float:
+        return (self.height_factor + 0.25) * self.module
+
+
+def rack_cutter(params: RackParams) -> Cutter:
+    """The rack's tooth space: the same shape as the cutter that generates gear roots."""
+    return _cutter(params.module, params.pressure_angle, params.dedendum, params.backlash)
+
+
+def rack_teeth_for_length(length: float, params: RackParams) -> int:
+    """Hybrid sizing for a rack: the whole number of pitches nearest the line length (at least 1)."""
+    if params.pitch <= 0:
+        return 1
+    return max(1, int(math.floor(length / params.pitch + 0.5)))
+
+
+def rack_tooth_centers(length: float, params: RackParams, offset: float = 0.0) -> list[float]:
+    """s of every tooth whose whole cell fits on [0, length]."""
+    p, tol = params.pitch, 1e-9
+    if p <= 0 or length <= 0:
+        return []
+    first = math.ceil((-tol - offset) / p)
+    last = math.floor((length + tol - offset) / p) - 1
+    return [offset + p / 2.0 + i * p for i in range(first, last + 1)]
+
+
+def rack_point(origin: Point, direction: float, side: int, s: float, h: float) -> Point:
+    """Sketch point of rack coordinates (s, h)."""
+    ux, uy = math.cos(direction), math.sin(direction)
+    nx, ny = -side * uy, side * ux
+    return (origin[0] + s * ux + h * nx, origin[1] + s * uy + h * ny)
+
+
+def rack_coords(origin: Point, direction: float, side: int, pt: Point) -> tuple[float, float]:
+    """Rack coordinates (s, h) of a sketch point (the inverse of rack_point)."""
+    ux, uy = math.cos(direction), math.sin(direction)
+    dx, dy = pt[0] - origin[0], pt[1] - origin[1]
+    return dx * ux + dy * uy, side * (-dx * uy + dy * ux)
+
+
+def rack_local_segments(params: RackParams, length: float, offset: float = 0.0,
+                        body: float = 0.0) -> list[Segment]:
+    """The outline in rack coordinates (s, h): the toothed edge from (0, −hf) to (L, −hf), then,
+    if body > 0, down, back and up to close the loop. Every arc here is counter-clockwise."""
+    c = rack_cutter(params)
+    a, alpha, p = params.addendum, params.pressure_angle, params.pitch
+    hf, rho, w, xc, dc = c.depth, c.corner_radius, c.half_width, c.corner_x, c.corner_depth
+    foot_dx = rho * math.cos(alpha)
+    foot_h = -dc - rho * math.sin(alpha)
+    tip_dx = w + a * math.tan(alpha)
+    corner_sweep = math.pi / 2.0 - alpha
+
+    segments: list[Segment] = []
+    cursor = 0.0   # s where the pending root run starts
+
+    def root_to(s: float) -> None:
+        if s - cursor > 1e-12:
+            segments.append(Line((cursor, -hf), (s, -hf)))
+
+    for center in rack_tooth_centers(length, params, offset):
+        b = center - p / 2.0          # space center on the tooth's left
+        e = center + p / 2.0          # space center on its right
+        root_to(b + xc)
+        tip_left = (b + tip_dx, a)
+        tip_right = (e - tip_dx, a)
+        if rho > 0:
+            segments.append(Arc((b + xc, -dc), rho, -math.pi / 2.0, corner_sweep))
+        segments.append(Line((b + xc + foot_dx, foot_h), tip_left))
+        segments.append(Line(tip_left, tip_right))
+        segments.append(Line(tip_right, (e - xc - foot_dx, foot_h)))
+        if rho > 0:
+            segments.append(Arc((e - xc, -dc), rho, -math.pi + alpha, corner_sweep))
+        cursor = e - xc
+    root_to(length)
+    if body > 0:
+        bottom = -hf - body
+        segments += [Line((length, -hf), (length, bottom)), Line((length, bottom), (0.0, bottom)),
+                     Line((0.0, bottom), (0.0, -hf))]
+    return segments
+
+
+def place_segment(seg: Segment, origin: Point, direction: float, side: int) -> Segment:
+    """A segment in rack coordinates, moved onto the sketch. side = RIGHT mirrors, which reverses arcs."""
+    def place(pt: Point) -> Point:
+        return rack_point(origin, direction, side, pt[0], pt[1])
+    if isinstance(seg, Line):
+        return Line(place(seg.start), place(seg.end))
+    if isinstance(seg, Arc):
+        if side == LEFT:
+            return Arc(place(seg.center), seg.radius, seg.start_angle + direction, seg.sweep, seg.clockwise)
+        return Arc(place(seg.center), seg.radius, direction - seg.start_angle - seg.sweep, seg.sweep,
+                   not seg.clockwise)
+    return Spline([place(pt) for pt in seg.points])
+
+
+@dataclass
+class RackProfile:
+    """A rack outline as drawn: segments in sketch mm, plus where and how it was placed."""
+    params: RackParams
+    origin: Point
+    direction: float
+    side: int
+    length: float
+    offset: float
+    body: float
+    tooth_centers: list[float]
+    segments: list[Segment]
+    warnings: list[str] = field(default_factory=list)
+
+    @property
+    def closed(self) -> bool:
+        return self.body > 0
+
+    def point(self, s: float, h: float) -> Point:
+        return rack_point(self.origin, self.direction, self.side, s, h)
+
+
+def build_rack(params: RackParams, origin: Point, direction: float, side: int, length: float,
+               offset: float = 0.0, body: float = 0.0) -> RackProfile:
+    local = rack_local_segments(params, length, offset, body)
+    placed = [place_segment(seg, origin, direction, side) for seg in local]
+    return RackProfile(params, origin, direction, side, length, offset, body,
+                       rack_tooth_centers(length, params, offset), placed)
+
+
+def rack_top_land(params: RackParams) -> float:
+    a = params.addendum
+    return params.pitch / 2.0 - params.backlash / 2.0 - 2.0 * a * math.tan(params.pressure_angle)
+
+
+def rack_factor_max(params: RackParams) -> float:
+    """Largest tooth height factor for a rack: top land ≥ 0.2·m, and the space (the cutter tooth)
+    must not come to a point above its root."""
+    m, tan_a = params.module, math.tan(params.pressure_angle)
+    if m <= 0:
+        return FACTOR_CAP
+    by_land = (params.pitch / 2.0 - params.backlash / 2.0 - MIN_TOP_LAND * m) / (2.0 * m * tan_a)
+    w = params.pitch / 4.0 + params.backlash / 4.0
+    by_space = (w / tan_a) / m - 0.25 - 1e-6
+    return math.floor(min(by_land, by_space, FACTOR_CAP) * 1e4) / 1e4
+
+
+def check_rack(params: RackParams, length: float, resize: bool, offset: float = 0.0,
+               body: float = 0.0) -> Check:
+    """Blocking errors and warnings for a rack on a line of `length` mm (before any resize)."""
+    check = Check()
+    p = params.pitch
+    if params.module <= 0:
+        check.errors.append('Module must be greater than 0.')
+    if params.backlash < 0:
+        check.errors.append('Backlash cannot be negative.')
+    if body < 0:
+        check.errors.append('Backing thickness cannot be negative.')
+    if length <= 0:
+        check.errors.append('The line has no length.')
+    if check.errors:
+        return check
+    if params.backlash >= p / 2.0:
+        check.errors.append('Backlash is larger than the tooth itself.')
+        return check
+    k_max = rack_factor_max(params)
+    if params.height_factor > k_max + 1e-9:
+        check.errors.append(f'Tooth height {params.height_factor:g} is above the maximum {k_max:.2f} for a rack '
+                            '(the tips would get too narrow).')
+        return check
+    if params.height_factor < FACTOR_FLOOR - 1e-9:
+        check.errors.append(f'Tooth height {params.height_factor:g} is below the minimum {FACTOR_FLOOR:g}.')
+        return check
+    drawn_length = rack_teeth_for_length(length, params) * p if resize else length
+    teeth = len(rack_tooth_centers(drawn_length, params, offset))
+    if teeth > MAX_TEETH:
+        check.errors.append(f"That's {teeth} teeth; a rack can have at most {MAX_TEETH}. Use a shorter line "
+                            f'(up to {MAX_TEETH * p:.0f} mm) or a larger module.')
+        return check
+    if teeth == 0:
+        if drawn_length < p:
+            check.errors.append(f'The line is shorter than one tooth (pitch {p:.2f} mm).')
+        else:
+            check.errors.append('No whole tooth fits on the line at this offset.')
+        return check
+    if not resize:
+        leftover = length - teeth * p
+        if leftover > TANGENCY_TOL_MM:
+            check.warnings.append(f'Resize is off: {leftover:.2f} mm of the line has no teeth.')
+    return check
+
+
+def profile_area(segments: list[Segment]) -> float:
+    """Signed area enclosed by a closed loop of segments (counter-clockwise positive), by Green's
+    theorem: exact for lines and arcs, splines as polylines through their points."""
+    total = 0.0
+    for seg in segments:
+        if isinstance(seg, Arc):
+            (cx, cy), r = seg.center, seg.radius
+            f1, f2 = seg.start_angle, seg.start_angle + seg.sweep
+            term = (cx * r * (math.sin(f2) - math.sin(f1)) - cy * r * (math.cos(f2) - math.cos(f1))
+                    + r * r * (f2 - f1))
+            total += -term if seg.clockwise else term
+        else:
+            pts = seg.points if isinstance(seg, Spline) else [seg.start, seg.end]
+            for (x1, y1), (x2, y2) in zip(pts, pts[1:]):
+                total += x1 * y2 - x2 * y1
+    return total / 2.0
+
+
+@dataclass
+class RackRecord:
+    """Everything stored on a rack's pitch line."""
+    params: RackParams
+    rack_id: str
+    side: int = LEFT
+    offset: float = 0.0
+    resize: bool = True
+    body: float = 0.0
+    teeth: int = 0                 # as drawn
+    origin: Point = (0.0, 0.0)     # where the rack was drawn: the line's start, direction and length then
+    direction: float = 0.0
+    length: float = 0.0
+    mesh_with: str = ''            # reserved for rack-and-pinion meshing
+
+
+def to_rack_attribute(record: RackRecord) -> str:
+    params = record.params
+    return json.dumps({
+        'version': RACK_ATTR_VERSION,
+        'id': record.rack_id,
+        'module_mm': params.module,
+        'pressure_angle_deg': math.degrees(params.pressure_angle),
+        'tooth_height_factor': params.height_factor,
+        'backlash_mm': params.backlash,
+        'side': record.side,
+        'offset_mm': record.offset,
+        'resize': record.resize,
+        'body_mm': record.body,
+        'teeth': record.teeth,
+        'origin_mm': list(record.origin),
+        'direction_rad': record.direction,
+        'length_mm': record.length,
+        'mesh_with': record.mesh_with,
+    })
+
+
+def from_rack_attribute(value: str) -> Optional[RackRecord]:
+    """Parse a stored rack attribute, or None if it isn't one."""
+    try:
+        data = json.loads(value)
+        side = int(data['side'])
+        if side not in (LEFT, RIGHT) or not data['id']:
+            return None
+        origin = data['origin_mm']
+        params = RackParams(
+            module=float(data['module_mm']),
+            pressure_angle=math.radians(float(data['pressure_angle_deg'])),
+            backlash=float(data.get('backlash_mm', 0.0)),
+            height_factor=float(data.get('tooth_height_factor', 1.0)),
+        )
+        return RackRecord(
+            params=params,
+            rack_id=str(data['id']),
+            side=side,
+            offset=float(data.get('offset_mm', 0.0)),
+            resize=bool(data.get('resize', True)),
+            body=float(data.get('body_mm', 0.0)),
+            teeth=int(data.get('teeth', 0)),
+            origin=(float(origin[0]), float(origin[1])),
+            direction=float(data['direction_rad']),
+            length=float(data['length_mm']),
+            mesh_with=str(data.get('mesh_with', '')),
+        )
+    except (ValueError, KeyError, TypeError, AttributeError, IndexError):
+        return None
+
+
+# ---------------------------------------------------------------------------
 # SVG debug output
 # ---------------------------------------------------------------------------
 
-def _svg_path(profile: Profile) -> str:
+def _svg_path(segments: list[Segment], close: bool = True) -> str:
     def pt(p: Point) -> str:
         return f'{p[0]:.5f},{-p[1]:.5f}'  # flip y for SVG
 
-    parts = [f'M {pt(profile.segments[0].start)}']
-    for seg in profile.segments:
+    parts = [f'M {pt(segments[0].start)}']
+    for seg in segments:
         if isinstance(seg, Arc):
             large = 1 if seg.sweep > math.pi else 0
             # y is flipped, so CCW in math coordinates is sweep-flag 0 in SVG.
-            parts.append(f'A {seg.radius:.5f},{seg.radius:.5f} 0 {large} 0 {pt(seg.end)}')
+            sweep_flag = 1 if seg.clockwise else 0
+            parts.append(f'A {seg.radius:.5f},{seg.radius:.5f} 0 {large} {sweep_flag} {pt(seg.end)}')
         elif isinstance(seg, Spline):
             parts.extend(f'L {pt(p)}' for p in seg.points[1:])
         else:
             parts.append(f'L {pt(seg.end)}')
-    parts.append('Z')
+    if close:
+        parts.append('Z')
     return ' '.join(parts)
 
 
-def to_svg(profiles: Union[Profile, list[Profile]], path: str) -> None:
+def _svg_extent(p: Union[Profile, RackProfile]) -> tuple[list[float], list[float]]:
+    """x and y (SVG, y flipped) extremes a profile needs on the canvas."""
+    if isinstance(p, RackProfile):
+        pts = [seg_pt for seg in p.segments for seg_pt in (seg.start, seg.end)]
+        pts += [p.origin, p.point(p.length, 0.0)]
+        pad = p.params.module
+        return ([min(x for x, _ in pts) - pad, max(x for x, _ in pts) + pad],
+                [min(-y for _, y in pts) - pad, max(-y for _, y in pts) + pad])
+    reach = max(p.tip_radius, p.root_radius) + p.params.module
+    return [p.center[0] - reach, p.center[0] + reach], [-p.center[1] - reach, -p.center[1] + reach]
+
+
+def to_svg(profiles: Union[Profile, RackProfile, list], path: str) -> None:
     """Write one profile, or a meshing set, to an SVG for visual checks.
 
-    Pitch circles are dashed, base circles dotted, tooth 0 centerlines drawn in red.
+    Gears: pitch circles dashed, base circles dotted, tooth 0 centerlines in red.
+    Racks: pitch line dashed, an arrow along the line from its start, and a red tick toward the teeth.
     """
-    if isinstance(profiles, Profile):
+    if isinstance(profiles, (Profile, RackProfile)):
         profiles = [profiles]
     xs, ys = [], []
     for p in profiles:
-        reach = max(p.tip_radius, p.root_radius) + p.params.module
-        xs += [p.center[0] - reach, p.center[0] + reach]
-        ys += [-p.center[1] - reach, -p.center[1] + reach]
+        px, py = _svg_extent(p)
+        xs += px
+        ys += py
     x0, y0 = min(xs), min(ys)
     w, h = max(xs) - x0, max(ys) - y0
     stroke = max(w, h) / 1500.0
@@ -1389,10 +1721,23 @@ def to_svg(profiles: Union[Profile, list[Profile]], path: str) -> None:
            f'<rect x="{x0}" y="{y0}" width="{w}" height="{h}" fill="white"/>']
     colors = ['#3b6fb6', '#c9762b', '#3a9a5b', '#8a4fb0']
     for i, p in enumerate(profiles):
-        cx, cy = p.center[0], -p.center[1]
         color = colors[i % len(colors)]
+        if isinstance(p, RackProfile):
+            fill = color if p.closed else 'none'
+            out.append(f'<path d="{_svg_path(p.segments, p.closed)}" fill="{fill}" fill-opacity="0.25" '
+                       f'stroke="{color}" stroke-width="{stroke}"/>')
+            (sx, sy), (ex, ey) = p.origin, p.point(p.length, 0.0)
+            out.append(f'<line x1="{sx}" y1="{-sy}" x2="{ex}" y2="{-ey}" stroke="#666" stroke-width="{stroke / 2}" '
+                       f'stroke-dasharray="{stroke * 6},{stroke * 4}"/>')
+            m = p.params.module
+            (ax, ay), (tx, ty) = p.point(2.0 * m, 0.0), p.point(0.0, 1.5 * m)
+            out.append(f'<line x1="{sx}" y1="{-sy}" x2="{ax}" y2="{-ay}" stroke="black" stroke-width="{stroke}"/>')
+            out.append(f'<circle cx="{ax}" cy="{-ay}" r="{stroke * 3}" fill="black"/>')
+            out.append(f'<line x1="{sx}" y1="{-sy}" x2="{tx}" y2="{-ty}" stroke="red" stroke-width="{stroke}"/>')
+            continue
+        cx, cy = p.center[0], -p.center[1]
         fill = 'none' if p.params.internal else color
-        out.append(f'<path d="{_svg_path(p)}" fill="{fill}" fill-opacity="0.25" stroke="{color}" '
+        out.append(f'<path d="{_svg_path(p.segments)}" fill="{fill}" fill-opacity="0.25" stroke="{color}" '
                    f'stroke-width="{stroke}" fill-rule="evenodd"/>')
         out.append(f'<circle cx="{cx}" cy="{cy}" r="{p.params.pitch_radius}" fill="none" stroke="#666" '
                    f'stroke-width="{stroke / 2}" stroke-dasharray="{stroke * 6},{stroke * 4}"/>')

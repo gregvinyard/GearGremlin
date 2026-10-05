@@ -164,6 +164,13 @@ def height_note(params: Optional[gm.GearParams], partner: Optional[gm.GearParams
     return f"Valid: {lo:.2f}–{hi:.2f}. Minimum can't be fully checked without a Mesh with partner."
 
 
+def rack_height_note(params: Optional[gm.RackParams]) -> str:
+    """The note under the tooth height input for a rack: its valid range."""
+    if params is None or params.module <= 0:
+        return ''
+    return f'Valid: {gm.FACTOR_FLOOR:.2f}–{gm.rack_factor_max(params):.2f}.'
+
+
 def remembered_values(inputs) -> dict:
     """The shared settings as they stand in the dialog."""
     return {
