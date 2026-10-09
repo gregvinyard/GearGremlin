@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="AddInIcon.png" alt="GearGremlin icon" width="128">
+</p>
+
 # GearGremlin
 
 A Fusion 360 add-in that turns sketch circles into involute spur gear profiles that mesh, tooth for tooth, with their neighbours. It also turns sketch lines into racks, and lays out complete planetary gear sets.
