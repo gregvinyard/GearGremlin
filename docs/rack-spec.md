@@ -231,6 +231,8 @@ If anything fails, read `gear_gremlin.log` before guessing.
 
 ## Step 2: Rack-and-pinion meshing (outline; refine with the user first)
 
+**Status:** built; see SPEC.md "Rack and pinion" for what was implemented. The phase rule below was confirmed by an independent tooth-faces-gap pytest (both sides, five directions, gear-first and rack-first) and by a collision sweep from the real placement (aligned pairs roll clean; half- and eighth-tooth misalignments collide). Differences from this outline: the interference check is a sweep over an endless rack with a 0.001·m touch tolerance, and the rack's *Offset along line* is added after alignment (stored as `offset_mm`, with the total in `phase_mm`).
+
 - **Mesh with** on a circle gear accepts a rack line, and on a rack accepts a gear circle. Module, pressure angle and k must match (`same_system`, extended to `RackParams`). Internal gears can't mesh with a rack.
 - **Tangency:** the pinion center is on the teeth side at distance `r` (its pitch radius) from the line. Contact point `C` = the foot of the perpendicular. Its `s_c` must fall within the drawn teeth, with a margin, or warn. The user constrains it with a line–circle tangent constraint. Warn if the distance is off by more than `TANGENCY_TOL_MM`.
 - **Phase:** the rack phase at `C` is `q = frac((s_c − (p/2 + offset)) / p)`, where 0 means a tooth centerline is at `C`. The gear phase `p_g` is as in SPEC "Mesh alignment", with `d` = the direction from the gear center to `C` (= `−n`). Derivation: the gear's counter-clockwise tangent at `C` is `σ·u`, and `r·τ = p`, so:

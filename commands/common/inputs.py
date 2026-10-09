@@ -171,6 +171,18 @@ def rack_height_note(params: Optional[gm.RackParams]) -> str:
     return f'Valid: {gm.FACTOR_FLOOR:.2f}–{gm.rack_factor_max(params):.2f}.'
 
 
+def rack_pair_height_note(gear: gm.GearParams, rack: gm.RackParams, locked_to: str) -> str:
+    """The note under Tooth height when a gear and a rack mesh: the lock, and the pair's contact ratio.
+    locked_to names the partner ('gear' or 'rack')."""
+    if gear.module <= 0 or gear.teeth < gm.MIN_TEETH or rack.module <= 0:
+        return ''
+    k = gear.height_factor if locked_to == 'gear' else rack.height_factor
+    g, r = gear.with_factor(k), rack.with_factor(k)
+    cr = gm.rack_contact_ratio(g, gm.gear_radii(g), r)
+    return (f"Locked to the {locked_to}'s factor ({k:g}) because meshing parts must match. "
+            f'Contact ratio at {k:g}: {cr:.2f}.')
+
+
 def remembered_values(inputs) -> dict:
     """The shared settings as they stand in the dialog."""
     return {

@@ -63,6 +63,55 @@ def line_frame(line: adsk.fusion.SketchLine) -> tuple:
     return (to_mm(s.x), to_mm(s.y)), math.atan2(dy, dx), math.hypot(dx, dy)
 
 
+def rack_pose(line: adsk.fusion.SketchLine, record: gm.RackRecord) -> gm.RackPose:
+    """A rack as it is now, for meshing: the live pitch line, with the phase its teeth were drawn with."""
+    origin, direction, length = line_frame(line)
+    return gm.RackPose(record.params, origin, direction, record.side, record.tooth_phase, length)
+
+
+def _meshes(gear: gm.GearParams, center: gm.Point, theta0: float, pose: gm.RackPose) -> tuple:
+    """(touching, lined up) for a gear and a rack: tangent on the teeth side within the line, and in
+    the same system and phase."""
+    s, h = gm.rack_contact(pose, center)
+    touching = (abs(h - gear.pitch_radius) <= gm.TANGENCY_TOL_MM
+                and -gm.TANGENCY_TOL_MM <= s <= pose.length + gm.TANGENCY_TOL_MM)
+    lined_up = (not gm._match_errors(gear, pose.params) and touching
+                and gm.rack_mesh_error(gear, center, theta0, pose) <= 1e-6)
+    return touching, lined_up
+
+
+def gear_rack_warnings(sketch: adsk.fusion.Sketch, gear_id: str, params: gm.GearParams, center: gm.Point,
+                       theta0: float) -> list:
+    """Out-of-phase check for a gear against racks: every rack it touches, plus racks aligned to it."""
+    if params.internal:
+        return []
+    warnings = []
+    for line in rack_lines(sketch):
+        record = read_rack(line)
+        if record is None:
+            continue
+        touching, lined_up = _meshes(params, center, theta0, rack_pose(line, record))
+        dependent = bool(gear_id) and record.mesh_with == gear_id
+        if (touching or dependent) and not lined_up:
+            warnings.append('The rack meshed with this gear no longer lines up. Edit it to re-align.')
+    return list(dict.fromkeys(warnings))
+
+
+def rack_gear_warnings(sketch: adsk.fusion.Sketch, rack_id: str, pose: gm.RackPose) -> list:
+    """Out-of-phase check for a rack against gears: every gear it touches, plus gears aligned to it."""
+    warnings = []
+    for circle in drawing.gear_circles(sketch):
+        record = drawing.read_gear(circle)
+        if record is None or record.params.internal:
+            continue
+        touching, lined_up = _meshes(record.params, drawing.circle_center_mm(circle), record.theta0, pose)
+        dependent = bool(rack_id) and record.mesh_with == rack_id
+        if (touching or dependent) and not lined_up:
+            warnings.append(f'The {record.params.teeth}-tooth gear meshed with this rack no longer lines up. '
+                            'Edit it to re-align.')
+    return list(dict.fromkeys(warnings))
+
+
 def in_plane_error(line: adsk.fusion.SketchLine) -> str:
     for pt in (line.startSketchPoint, line.endSketchPoint):
         if abs(pt.geometry.z) > 1e-6:
@@ -361,11 +410,12 @@ def _undo_resize(line: adsk.fusion.SketchLine, attempt: _Attempt) -> None:
 # ---------------------------------------------------------------------------
 
 def make_rack(line: adsk.fusion.SketchLine, params: gm.RackParams, side: int = gm.LEFT, offset: float = 0.0,
-              body: float = 0.0, resize: bool = True, finalize: bool = False,
-              edit: bool = False) -> drawing.GearResult:
+              body: float = 0.0, resize: bool = True, finalize: bool = False, edit: bool = False,
+              partner: Optional[adsk.fusion.SketchCircle] = None) -> drawing.GearResult:
     """Resize the line and draw a rack along it.
 
-    With edit, `line` must already be a rack: its old curves are deleted and redrawn under the
+    With `partner` (a gear's pitch circle), the teeth are phased to mesh with that gear, and
+    `offset` is added after the alignment, as a gear's rotation offset is. With edit, `line` must already be a rack: its old curves are deleted and redrawn under the
     same id. With finalize (execute only), the line is made construction geometry and the rack
     record is written to it.
     """
@@ -388,6 +438,13 @@ def make_rack(line: adsk.fusion.SketchLine, params: gm.RackParams, side: int = g
         result.errors.append('This line is already a rack. Pick a different line.')
     elif drawing.read_gear(line) is not None or rack_for_entity(line) is not None:
         result.errors.append('That line is part of a gear made by this tool.')
+    partner_record = None
+    if partner is not None:
+        partner_record = drawing.read_gear(partner)
+        if partner_record is None:
+            result.errors.append('Mesh with: not a gear made by this tool.')
+        elif partner.parentSketch != sketch:
+            result.errors.append('Mesh with must be in the same sketch.')
     if result.errors:
         return result
 
@@ -406,7 +463,24 @@ def make_rack(line: adsk.fusion.SketchLine, params: gm.RackParams, side: int = g
     origin, direction, length = line_frame(line)
     if target is not None:
         length = target
-    profile = gm.build_rack(params, origin, direction, side, length, offset, body)
+    phase = offset
+    pose = gm.RackPose(params, origin, direction, side, phase, length)
+    if partner_record is not None:
+        gear_center = drawing.circle_center_mm(partner)
+        mesh = gm.check_rack_mesh(partner_record.params, gear_center, pose)
+        result.errors += mesh.errors
+        result.warnings += mesh.warnings
+        if result.errors:
+            return result
+        phase = gm.align_rack_phase(pose, partner_record.params, gear_center, partner_record.theta0) + offset
+        pose = gm.RackPose(params, origin, direction, side, phase, length)
+        report = gm.rack_pair_report(partner_record.params, gm.gear_radii(partner_record.params), params)
+        result.infos += report.infos
+        result.warnings += [w for w in report.warnings if w not in result.warnings]
+    profile = gm.build_rack(params, origin, direction, side, length, phase, body)
+    if not profile.tooth_centers:
+        result.errors.append('No whole tooth fits on the line at this offset.')
+        return result
     result.rack = profile
     if not profile.closed:
         result.infos.append("Outline is open, so it won't extrude.")
@@ -441,11 +515,13 @@ def make_rack(line: adsk.fusion.SketchLine, params: gm.RackParams, side: int = g
                 drawing.tag_part(result.entities[-1], rack_id)
     finally:
         sketch.isComputeDeferred = deferred
+    result.warnings += rack_gear_warnings(sketch, rack_id, pose)
     if finalize:
         line.isConstruction = True
         write_rack(line, gm.RackRecord(
             params=params, rack_id=rack_id, side=side, offset=offset, resize=resize, body=body,
-            teeth=len(profile.tooth_centers), origin=origin, direction=direction, length=length))
+            teeth=len(profile.tooth_centers), origin=origin, direction=direction, length=length,
+            mesh_with=partner_record.gear_id if partner_record else '', phase=phase))
         if repoint is not None:
             result.repointed, result.not_repointed = repoint.finish({e.entityToken for e in result.entities})
     return result

@@ -48,7 +48,7 @@ FLIP = 'flip_side'
 OFFSET = 'rack_offset'
 BODY = 'rack_body'
 
-GEAR_ONLY = (GEAR_TYPE, TEETH, RESIZE, MESH, ROTATION, REFS)
+GEAR_ONLY = (GEAR_TYPE, TEETH, RESIZE, ROTATION, REFS)
 RACK_ONLY = (RESIZE_LINE, FLIP, OFFSET, BODY)
 
 TYPE_NAMES = {gm.EXTERNAL: 'External', gm.INTERNAL: 'Internal'}
@@ -206,10 +206,13 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     body = inputs.addValueInput(BODY, 'Backing thickness', 'mm', adsk.core.ValueInput.createByReal(body_mm / 10.0))
     _tip(body, 'Solid material below the tooth roots; 0 draws only the toothed edge.')
 
-    mesh = inputs.addSelectionInput(MESH, 'Mesh with', 'Select a gear made by GearGremlin to line the teeth up with')
+    mesh = inputs.addSelectionInput(MESH, 'Mesh with',
+                                    'Select a gear or rack made by GearGremlin to line the teeth up with')
     mesh.addSelectionFilter('SketchCircles')
+    mesh.addSelectionFilter('SketchLines')
     mesh.setSelectionLimits(0, 1)
-    _tip(mesh, 'Optional. Pick an existing gear\'s circle and the teeth are rotated to mesh with it.')
+    _tip(mesh, 'Optional. Pick an existing gear\'s circle (or, for a gear, a rack\'s line) and the teeth are '
+               'lined up to mesh with it.')
 
     rotation = inputs.addAngleValueCommandInput(ROTATION, 'Rotation offset',
                                                 adsk.core.ValueInput.createByReal(remembered.get('rotation', 0.0)))
@@ -225,12 +228,16 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
     if record is not None:
         pitch.addSelection(_edit_circle)
         pitch.isEnabled = False
-        partner = drawing.find_gear_circle(_edit_circle.parentSketch, record.mesh_with)
+        partner = (drawing.find_gear_circle(_edit_circle.parentSketch, record.mesh_with)
+                   or rack_drawing.find_rack_line(_edit_circle.parentSketch, record.mesh_with))
         if partner is not None:
             mesh.addSelection(partner)
     elif rack_record is not None:
         pitch.addSelection(_edit_line)
         pitch.isEnabled = False
+        partner = drawing.find_gear_circle(_edit_line.parentSketch, rack_record.mesh_with)
+        if partner is not None:
+            mesh.addSelection(partner)
     elif adsk.fusion.SketchCircle.cast(preselected) and drawing.read_gear(preselected) is None:
         pitch.addSelection(preselected)
         if not _apply_plan(inputs, preselected):
@@ -238,6 +245,7 @@ def command_created(args: adsk.core.CommandCreatedEventArgs):
         mesh.hasFocus = True
     elif adsk.fusion.SketchLine.cast(preselected) and rack_drawing.owner_for_entity(preselected) is None:
         pitch.addSelection(preselected)
+        mesh.hasFocus = True
     _show_inputs_for(inputs)
     _sync_height(inputs)
 
@@ -413,12 +421,36 @@ def _params(inputs) -> gm.GearParams:
     )
 
 
+def _mesh_entity(inputs):
+    """The Mesh with selection: a circle, a line, or None."""
+    sel: adsk.core.SelectionCommandInput = inputs.itemById(MESH)
+    if sel.selectionCount == 0:
+        return None
+    entity = sel.selection(0).entity
+    return adsk.fusion.SketchCircle.cast(entity) or adsk.fusion.SketchLine.cast(entity)
+
+
 def _partner_record(inputs) -> Optional[gm.GearRecord]:
-    """The Mesh with partner's record. None for a rack, which has no Mesh with (yet)."""
+    """The Mesh with partner's record when it's a gear, else None."""
+    partner = adsk.fusion.SketchCircle.cast(_mesh_entity(inputs))
+    return drawing.read_gear(partner) if partner is not None else None
+
+
+def _partner_rack(inputs) -> Optional[gm.RackRecord]:
+    """The Mesh with partner's record when it's a rack (only a gear can mesh with one), else None."""
     if _selected_line(inputs) is not None:
         return None
-    partner = _selected_circle(inputs, MESH)
-    return drawing.read_gear(partner) if partner is not None else None
+    partner = adsk.fusion.SketchLine.cast(_mesh_entity(inputs))
+    return rack_drawing.read_rack(partner) if partner is not None else None
+
+
+def _partner_params(inputs):
+    """The partner's parameters (GearParams or RackParams), if it's a valid kind of partner."""
+    rack_partner = _partner_rack(inputs)
+    if rack_partner is not None:
+        return rack_partner.params
+    record = _partner_record(inputs)
+    return record.params if record is not None else None
 
 
 def _suggest_teeth(inputs) -> None:
@@ -430,17 +462,22 @@ def _suggest_teeth(inputs) -> None:
 
 def _sync_height(inputs) -> None:
     """Lock the tooth height to the Mesh with partner's, or unlock it, and refresh the note."""
-    record = _partner_record(inputs)
-    if record is not None:
-        ci.set_height(inputs, record.params.height_factor)
-    ci.lock_height(inputs, record is not None)
+    partner = _partner_params(inputs)
+    if partner is not None:
+        ci.set_height(inputs, partner.height_factor)
+    ci.lock_height(inputs, partner is not None)
     _update_height_note(inputs)
 
 
 def _update_height_note(inputs) -> None:
     if _selected_line(inputs) is not None:
+        record = _partner_record(inputs)
         try:
-            note = ci.rack_height_note(_rack_params(inputs))
+            rack = _rack_params(inputs)
+            if record is not None and not record.params.internal:
+                note = ci.rack_pair_height_note(record.params, rack, 'gear')
+            else:
+                note = ci.rack_height_note(rack)
         except Exception:
             note = ''
         _set_text(inputs, ci.HEIGHT_NOTE, f'<span style="color:#707070">{note}</span>' if note else '')
@@ -450,8 +487,14 @@ def _update_height_note(inputs) -> None:
     except Exception:
         params = None
     record = _partner_record(inputs)
+    rack_partner = _partner_rack(inputs)
     note = ''
-    if params is not None and params.module > 0 and params.teeth >= gm.MIN_TEETH:
+    if params is not None and rack_partner is not None:
+        try:
+            note = ci.rack_pair_height_note(params, rack_partner.params, 'rack')
+        except Exception:
+            note = ''
+    elif params is not None and params.module > 0 and params.teeth >= gm.MIN_TEETH:
         partner = record.params if record is not None else None
         if partner is not None and (partner.internal and params.internal):
             partner = None
@@ -493,6 +536,17 @@ def _pre_check(inputs) -> gm.Check:
         warning = drawing.dimension_expression_warning(circle)
         if warning:
             check.warnings.append(warning)
+    rack_line = adsk.fusion.SketchLine.cast(_mesh_entity(inputs))
+    if rack_line is not None:
+        rack_record = rack_drawing.read_rack(rack_line)
+        if rack_record is None:
+            check.errors.append('Mesh with: not a gear made by this tool.')
+        elif rack_line.parentSketch != circle.parentSketch:
+            check.errors.append('Mesh with must be in the same sketch.')
+        else:
+            mesh = gm.check_rack_mesh(params, drawing.circle_center_mm(circle),
+                                      rack_drawing.rack_pose(rack_line, rack_record))
+            check.errors.extend(mesh.errors)  # positional warnings wait for the preview, after resizing
     partner = _selected_circle(inputs, MESH)
     if partner is not None:
         data = drawing.read_gear(partner)
@@ -540,6 +594,20 @@ def _pre_check_rack(inputs) -> gm.Check:
         warning = rack_drawing.length_expression_warning(line)
         if warning:
             check.warnings.append(warning)
+    partner = _mesh_entity(inputs)
+    if adsk.fusion.SketchLine.cast(partner) is not None:
+        check.errors.append('A rack can only mesh with a gear. Pick a gear\'s circle for Mesh with.')
+    elif partner is not None:
+        data = drawing.read_gear(partner)
+        if data is None:
+            check.errors.append('Mesh with: not a gear made by this tool.')
+        elif partner.parentSketch != line.parentSketch:
+            check.errors.append('Mesh with must be in the same sketch.')
+        else:
+            origin, direction, length = rack_drawing.line_frame(line)
+            pose = gm.RackPose(_rack_params(inputs), origin, direction, _rack_side(inputs), 0.0, length)
+            mesh = gm.check_rack_mesh(data.params, drawing.circle_center_mm(partner), pose)
+            check.errors.extend(mesh.errors)  # positional warnings wait for the preview, after resizing
     return check
 
 
@@ -614,6 +682,7 @@ def _run(inputs, finalize: bool) -> drawing.GearResult:
             resize=inputs.itemById(RESIZE_LINE).value,
             finalize=finalize,
             edit=_edit_line is not None,
+            partner=_selected_circle(inputs, MESH),
         )
         # make_rack repeats check_rack's warnings; keep one copy of each.
         result.warnings = list(dict.fromkeys(check.warnings + result.warnings))
@@ -623,7 +692,7 @@ def _run(inputs, finalize: bool) -> drawing.GearResult:
             _selected_circle(inputs, PITCH),
             _params(inputs),
             resize=inputs.itemById(RESIZE).value,
-            partner=_selected_circle(inputs, MESH),
+            partner=_mesh_entity(inputs),
             rotation_offset=inputs.itemById(ROTATION).value,
             reference_circles=inputs.itemById(REFS).value,
             finalize=finalize,
@@ -686,7 +755,7 @@ def command_input_changed(args: adsk.core.InputChangedEventArgs):
     # change re-suggests. A planned circle's tooth count comes from its plan.
     if changed.id in (ci.MODULE, ci.MODULE_CUSTOM) or (changed.id == PITCH and _edit_circle is None and not planned):
         _suggest_teeth(inputs)
-    if changed.id == PITCH and _selected_circle(inputs, PITCH) is not None:
+    if changed.id == PITCH and (_selected_circle(inputs, PITCH) is not None or _selected_line(inputs) is not None):
         inputs.itemById(MESH).hasFocus = True
     if changed.id in (MESH, PITCH):
         _sync_height(inputs)
@@ -704,14 +773,16 @@ def command_validate_input(args: adsk.core.ValidateInputsEventArgs):
 
 def command_pre_select(args: adsk.core.SelectionEventArgs):
     """Pitch accepts circles that aren't gears yet and lines that aren't racks or part of a gear or
-    rack outline; Mesh with accepts only gears."""
+    rack outline; Mesh with accepts gears, and racks when the pitch selection is a circle."""
     if args.activeInput is None or args.activeInput.id not in (PITCH, MESH):
         return
     line = adsk.fusion.SketchLine.cast(args.selection.entity)
     if line is not None:
         # Cheap checks first: preSelect fires on every hover.
         if args.activeInput.id == MESH:
-            args.isSelectable = False
+            # A rack's line, for a gear (a rack can't mesh with a rack).
+            args.isSelectable = (_selected_line(args.activeInput.parentCommand.commandInputs) is None
+                                 and line != _edit_line and rack_drawing.read_rack(line) is not None)
         elif line.attributes.itemByName(drawing.ATTR_GROUP, drawing.PART_NAME) is not None:
             args.isSelectable = False
         elif rack_drawing.read_rack(line) is not None:

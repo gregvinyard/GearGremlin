@@ -12,9 +12,9 @@ Draw circles where you want gears, constrain them tangent, and GearGremlin does 
 
 - **Involute spur gears**, external or internal (ring gears). Module, pressure angle (14.5°, 20°, 25°), tooth count, and backlash are all settable.
 - **Hybrid sizing.** Pick a module and GearGremlin suggests the tooth count that best fits your circle, then resizes the circle to the exact pitch diameter. Tangent constraints keep meshing gears correctly spaced.
-- **Automatic mesh alignment.** Set *Mesh with* to an existing gear and the teeth are phased so a tooth faces a gap at the contact point. It works for external pairs and for pinions inside ring gears.
+- **Automatic mesh alignment.** Set *Mesh with* to an existing gear and the teeth are phased so a tooth faces a gap at the contact point. It works for external pairs, for pinions inside ring gears, and for a gear and a rack.
 - **Realistic tooth roots.** Roots are generated the way a hob cuts them (an ISO 53 profile A rack cutter). Small gears get a proper undercut, and large gears get a root fillet.
-- **Racks.** Select a line instead of a circle and GearGremlin draws a rack along it: straight-sided teeth with the same cutter-shaped roots as the gears, on whichever side you choose, with an optional solid backing so it extrudes straight away. The line is resized to a whole number of teeth.
+- **Racks.** Select a line instead of a circle and GearGremlin draws a rack along it: straight-sided teeth with the same cutter-shaped roots as the gears, on whichever side you choose, with an optional solid backing so it extrudes straight away. The line is resized to a whole number of teeth. Mesh a gear with a rack (or a rack with a gear) and the teeth line up, with the pair's contact ratio and any interference reported.
 - **Ring tip trimming.** Small pinions inside a ring would collide with the ring's tips. GearGremlin shortens the ring's tips just enough to clear the pinion over a full turn, and tells you which pinion set the trim.
 - **Tooth height factor.** Standard (1.0), Stub (0.8), or a custom value, with the valid range shown live.
 - **Contact-ratio checks.** Each pair's contact ratio is shown. Warnings explain how to fix a low one.
@@ -59,7 +59,14 @@ The live preview and the info box show the pitch diameter, tip and root diameter
    - **Backing thickness** is the solid strip below the tooth roots. Set it to 0 to draw only the toothed edge.
 4. Press **OK**. The line becomes construction geometry and the rack outline is drawn as one closed region, ready to extrude.
 
-A rack made with the same module, pressure angle, tooth height, and backlash as a gear has matching teeth. Meshing a gear with a rack automatically (*Mesh with*) isn't supported yet.
+A rack made with the same module, pressure angle, tooth height, and backlash as a gear has matching teeth.
+
+To mesh a gear with a rack, draw the gear's circle on the teeth side of the rack's line and constrain it **tangent** to the line. Then either:
+
+- make the rack first, then run GearGremlin on the circle and set **Mesh with** to the rack's line; or
+- make the gear first, then run GearGremlin on the line and set **Mesh with** to the gear's circle.
+
+The teeth are lined up at the contact point and the tooth height is locked to the partner's. The rack's *Offset along line* (or the gear's *Rotation offset*) is added after the alignment.
 
 ### Making a planetary set
 
@@ -72,7 +79,7 @@ A rack made with the same module, pressure angle, tooth height, and backlash as 
 
 Right-click a gear's circle, a rack's line, or one of their teeth and choose **Edit Gear**, or run GearGremlin with it selected. Change any setting and press **Update**.
 - Extrudes and revolves built on the gear or rack follow the new shape.
-- If an edit puts a neighbouring gear out of phase, a warning names it so you can edit that one too.
+- If an edit puts a neighbouring gear or rack out of phase, a warning names it so you can edit that one too.
 
 ### Tips
 
@@ -83,7 +90,6 @@ Right-click a gear's circle, a rack's line, or one of their teeth and choose **E
 ## Limitations
 
 - Spur gears and racks only: no helical, bevel, or worm gears, or profile shift.
-- A gear can't yet be meshed with a rack automatically. Line the teeth up yourself with the rack's offset or the gear's rotation offset.
 - Only the toothed profile is drawn. A ring gear's outer rim and any bores are up to you.
 - Keeping features attached through an edit covers extrudes and revolves in parametric designs. Features that pick individual tooth edges (for example a fillet on one tooth) can still break when the tooth shape changes.
 - Previews of large gears and long racks in busy sketches take a few seconds, mostly Fusion's own time to create the curves (a 200-tooth rack previews in about 2.5 s, a 200-tooth gear in about 5 s).

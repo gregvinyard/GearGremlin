@@ -288,11 +288,12 @@ def resize_check(circle: adsk.fusion.SketchCircle) -> str:
 
 
 def resize_circle(sketch: adsk.fusion.Sketch, circle: adsk.fusion.SketchCircle, diameter_mm: float,
-                  hold: Optional[list] = None) -> ResizeResult:
+                  hold: Optional[list] = None, hold_points: Optional[list] = None) -> ResizeResult:
     """Set the circle's diameter to diameter_mm through its dimension (adding one if needed).
 
     Circles in `hold` (typically existing gears) have their centers fixed during the
-    resize so the solver moves the new circle rather than gears whose teeth are drawn.
+    resize, as do the points in `hold_points` (racks' pitch lines), so the solver moves the
+    new circle rather than parts whose teeth are drawn.
     """
     result = ResizeResult()
     error = resize_check(circle)
@@ -308,8 +309,7 @@ def resize_circle(sketch: adsk.fusion.Sketch, circle: adsk.fusion.SketchCircle, 
     temporarily_fixed = []
     failure = None
     try:
-        for c in hold or []:
-            pt = c.centerSketchPoint
+        for pt in [c.centerSketchPoint for c in hold or []] + list(hold_points or []):
             if not pt.isFixed:
                 pt.isFixed = True
                 temporarily_fixed.append(pt)
@@ -451,10 +451,12 @@ def make_gear(circle: adsk.fusion.SketchCircle, params: gm.GearParams, resize: b
               reference_circles: bool = False, finalize: bool = False, edit: bool = False) -> GearResult:
     """Resize, align, and draw one gear on `circle`.
 
+    `partner` is the Mesh with partner: another gear's circle, or a rack's pitch line.
     With edit, `circle` must already be a gear: its old curves are deleted and redrawn under
     the same id. With finalize (execute only), the circle is made construction geometry and
     the gear record is written to it.
     """
+    from . import rack_drawing   # here, not at the top: rack_drawing imports this module
     result = GearResult()
     sketch = circle.parentSketch
     check = gm.check_params(params)
@@ -472,7 +474,15 @@ def make_gear(circle: adsk.fusion.SketchCircle, params: gm.GearParams, resize: b
         result.errors.append('This circle is already a gear. Pick a different circle.')
 
     partner_record = None
-    if partner is not None:
+    rack_line = adsk.fusion.SketchLine.cast(partner) if partner is not None else None
+    rack_record = None
+    if rack_line is not None:
+        rack_record = rack_drawing.read_rack(rack_line)
+        if rack_record is None:
+            result.errors.append('Mesh with: not a gear made by this tool.')
+        elif rack_line.parentSketch != sketch:
+            result.errors.append('Mesh with must be in the same sketch.')
+    elif partner is not None:
         partner_record = read_gear(partner)
         if partner_record is None:
             result.errors.append('Mesh with: not a gear made by this tool.')
@@ -487,7 +497,9 @@ def make_gear(circle: adsk.fusion.SketchCircle, params: gm.GearParams, resize: b
 
     if resize:
         hold = [c for c in gear_circles(sketch) if c != circle]
-        resized = resize_circle(sketch, circle, 2 * params.pitch_radius, hold)
+        hold_points = [pt for line in rack_drawing.rack_lines(sketch)
+                       for pt in (line.startSketchPoint, line.endSketchPoint)]
+        resized = resize_circle(sketch, circle, 2 * params.pitch_radius, hold, hold_points)
         if not resized.ok:
             result.errors.append(resized.error)
             return result
@@ -506,6 +518,14 @@ def make_gear(circle: adsk.fusion.SketchCircle, params: gm.GearParams, resize: b
         if result.errors:
             return result
         theta0 = gm.align_theta0(params, center, partner_record.params, partner_center, partner_record.theta0)
+    elif rack_record is not None:
+        pose = rack_drawing.rack_pose(rack_line, rack_record)
+        mesh = gm.check_rack_mesh(params, center, pose)
+        result.errors += mesh.errors
+        result.warnings += mesh.warnings
+        if result.errors:
+            return result
+        theta0 = gm.align_theta0_to_rack(params, center, pose)
     theta0 += rotation_offset
 
     # Drawn radii. A ring is trimmed (from scratch, also on edit) against every pinion it meets.
@@ -520,6 +540,10 @@ def make_gear(circle: adsk.fusion.SketchCircle, params: gm.GearParams, resize: b
     planned = read_plan(circle) is not None
     if partner_record is not None:
         report = gm.pair_report(params, radii, partner_record.params, partner_record.drawn_tip, planned)
+        result.infos += report.infos
+        result.warnings += [w for w in report.warnings if w not in result.warnings]
+    elif rack_record is not None:
+        report = gm.rack_pair_report(params, radii, rack_record.params)
         result.infos += report.infos
         result.warnings += [w for w in report.warnings if w not in result.warnings]
     if not params.internal:
@@ -564,12 +588,14 @@ def make_gear(circle: adsk.fusion.SketchCircle, params: gm.GearParams, resize: b
     finally:
         sketch.isComputeDeferred = deferred
     result.warnings += neighbor_warnings(sketch, circle, gear_id, params, center, theta0)
+    result.warnings += rack_drawing.gear_rack_warnings(sketch, gear_id, params, center, theta0)
     if finalize:
         circle.isConstruction = True
+        mesh_with = partner_record.gear_id if partner_record else (rack_record.rack_id if rack_record else '')
         write_gear(circle, gm.GearRecord(
             params=params, theta0=theta0, gear_id=gear_id, rotation_offset=rotation_offset,
             resize=resize, reference_circles=reference_circles,
-            mesh_with=partner_record.gear_id if partner_record else '', tip_radius=radii.tip))
+            mesh_with=mesh_with, tip_radius=radii.tip))
         if repoint is not None:
             result.repointed, result.not_repointed = repoint.finish({e.entityToken for e in result.entities})
     return result

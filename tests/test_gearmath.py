@@ -923,3 +923,175 @@ def test_rack_svgs():
             assert f.read().startswith('<svg')
     out = os.path.join(out_dir, 'rack_open_offset.svg')
     gm.to_svg(gm.build_rack(rack(alpha=math.radians(25)), (0.0, 0.0), 0.0, gm.LEFT, 6 * params.pitch, 1.5), out)
+
+
+# --- rack and pinion ---------------------------------------------------------
+
+def _pose(rack_params, direction_deg, side, phase, origin=(5.0, -3.0), length=200.0):
+    return gm.RackPose(rack_params, origin, math.radians(direction_deg), side, phase, length)
+
+
+def _gear_on_rack(gear, pose, s_c):
+    """Center of a gear tangent to the rack's pitch line at s_c, on the teeth side."""
+    return gm.rack_point(pose.origin, pose.direction, pose.side, s_c, gear.pitch_radius)
+
+
+def assert_tooth_faces_rack_gap(gear, center, theta0, pose):
+    """Independent of the phase formulas: at the contact point C, measure the nearest gear tooth's arc
+    offset along the gear's own counter-clockwise tangent, and the nearest rack tooth space's offset
+    along that same tangent. A tooth faces a gap when they agree, modulo the pitch."""
+    p = pose.params.pitch
+    s_c, _ = gm.rack_contact(pose, center)
+    c = gm.rack_point(pose.origin, pose.direction, pose.side, s_c, 0.0)
+    d = math.atan2(c[1] - center[1], c[0] - center[0])
+    tangent = (-math.sin(d), math.cos(d))
+    u = (math.cos(pose.direction), math.sin(pose.direction))
+    along = tangent[0] * u[0] + tangent[1] * u[1]            # ±1: which way the tangent runs along the line
+    tau = gear.angular_pitch
+    k = round((d - theta0) / tau)
+    e_gear = gear.pitch_radius * (theta0 + k * tau - d)     # arc offset of the nearest gear tooth
+    space = pose.phase + round((s_c - pose.phase) / p) * p  # nearest rack space center (s)
+    e_rack = (space - s_c) * along
+    off = ((e_gear - e_rack) / p) % 1.0
+    assert min(off, 1 - off) < 1e-9
+
+
+RACK_POSES = [(0, gm.LEFT, 0.0), (30, gm.RIGHT, 1.7), (137, gm.LEFT, -2.2), (-90, gm.RIGHT, 4.0), (200, gm.LEFT, 0.3)]
+
+
+@pytest.mark.parametrize('z', [8, 17, 31])
+@pytest.mark.parametrize('direction_deg, side, phase', RACK_POSES)
+def test_gear_aligned_to_rack_meshes(z, direction_deg, side, phase):
+    gear = ext(z, backlash=B)
+    pose = _pose(rack(backlash=B), direction_deg, side, phase)
+    center = _gear_on_rack(gear, pose, 37.3)
+    theta0 = gm.align_theta0_to_rack(gear, center, pose)
+    assert_tooth_faces_rack_gap(gear, center, theta0, pose)
+    assert gm.rack_mesh_error(gear, center, theta0, pose) < 1e-9
+    assert gm.rack_mesh_error(gear, center, theta0 + gear.angular_pitch / 2, pose) == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize('z', [8, 17, 31])
+@pytest.mark.parametrize('direction_deg, side, phase', RACK_POSES)
+def test_rack_aligned_to_gear_meshes(z, direction_deg, side, phase):
+    gear = ext(z, backlash=B)
+    pose = _pose(rack(backlash=B), direction_deg, side, 0.0)
+    center = _gear_on_rack(gear, pose, 52.9)
+    theta0 = 0.37 + phase
+    aligned = gm.align_rack_phase(pose, gear, center, theta0)
+    assert 0 <= aligned < pose.params.pitch
+    pose = gm.RackPose(pose.params, pose.origin, pose.direction, pose.side, aligned, pose.length)
+    assert_tooth_faces_rack_gap(gear, center, theta0, pose)
+    assert gm.rack_mesh_error(gear, center, theta0, pose) < 1e-9
+
+
+@pytest.mark.parametrize('direction_deg, side', [(0, gm.LEFT), (30, gm.RIGHT), (137, gm.LEFT), (-90, gm.RIGHT)])
+@pytest.mark.parametrize('z', [10, 23])
+def test_aligned_rack_and_gear_roll_without_collision(direction_deg, side, z):
+    """The sweep rolls the gear along the rack from the real placement, so a wrong phase rule (or a
+    wrong rolling direction) shows up as a collision."""
+    gear = ext(z, backlash=B)
+    pose = _pose(rack(backlash=B), direction_deg, side, 1.1)
+    center = _gear_on_rack(gear, pose, 61.0)
+    theta0 = gm.align_theta0_to_rack(gear, center, pose)
+    radii = gm.gear_radii(gear)
+    assert not gm.rack_pair_collides_at(gear, radii, center, theta0, pose, phases=24)
+    assert gm.rack_pair_collides_at(gear, radii, center, theta0 + gear.angular_pitch / 2, pose, phases=24)
+    assert gm.rack_pair_collides_at(gear, radii, center, theta0 + gear.angular_pitch / 8, pose, phases=24)
+
+
+@pytest.mark.parametrize('alpha_deg', [20, 25])
+@pytest.mark.parametrize('k', [0.8, 1.0])
+@pytest.mark.parametrize('z', [6, 8, 12, 17, 40])
+def test_gears_and_racks_clear_at_default_backlash(alpha_deg, k, z):
+    gear = ext(z, alpha=math.radians(alpha_deg), backlash=B, k=k)
+    assert not gm.rack_pair_collides(gear, rack(alpha=math.radians(alpha_deg), backlash=B, k=k))
+
+
+def test_rack_corner_grazes_14_5_degree_roots_at_zero_backlash():
+    """At 14.5° the cutter's straight flank stops below the rack's tip, so a sharp rack corner meets the
+    generated root fillet. Backlash clears it."""
+    a = math.radians(14.5)
+    assert gm.rack_pair_collides(ext(17, alpha=a), rack(alpha=a))
+    assert not gm.rack_pair_collides(ext(17, alpha=a, backlash=B), rack(alpha=a, backlash=B))
+
+
+@pytest.mark.parametrize('alpha_deg, k', [(20, 1.0), (25, 1.0), (14.5, 1.0), (20, 0.8)])
+def test_rack_contact_ratio_is_the_limit_of_a_large_gear(alpha_deg, k):
+    gear = ext(25, alpha=math.radians(alpha_deg), backlash=B, k=k)
+    big = ext(1500, alpha=math.radians(alpha_deg), backlash=B, k=k)
+    cr_rack = gm.rack_contact_ratio(gear, gm.gear_radii(gear), rack(alpha=math.radians(alpha_deg), backlash=B, k=k))
+    cr_big = gm.contact_ratio(gear, gm.gear_radii(gear), big, gm.gear_radii(big))
+    assert cr_rack == pytest.approx(cr_big, abs=0.01)
+
+
+def test_rack_contact_ratio_textbook():
+    """ε = (√(ra²−rb²) − r·sinα + m/sinα)/(p·cosα) when nothing else limits contact. At 25° the cutter's
+    straight flank runs past the rack's tip height (at 20° it ends exactly there, ISO 53), so the gear's
+    involute starts below where the rack's tip reaches."""
+    a = math.radians(25)
+    gear = ext(30, alpha=a)
+    r, rb = gear.pitch_radius, gear.base_radius
+    ra = gm.gear_radii(gear).tip
+    expected = (math.sqrt(ra * ra - rb * rb) - r * math.sin(a) + 2.0 / math.sin(a)) / (math.pi * 2.0 * math.cos(a))
+    assert gm.rack_contact_ratio(gear, gm.gear_radii(gear), rack(alpha=a)) == pytest.approx(expected, rel=1e-9)
+
+
+def test_check_rack_mesh():
+    pose = _pose(rack(), 30, gm.LEFT, 0.0, length=100.0)
+    gear = ext(20)
+    center = _gear_on_rack(gear, pose, 40.0)
+    assert gm.check_rack_mesh(gear, center, pose).ok and not gm.check_rack_mesh(gear, center, pose).warnings
+    assert 'Module' in gm.check_rack_mesh(ext(20, m=2.5), center, pose).errors[0]
+    assert 'Tooth height' in gm.check_rack_mesh(ext(20, k=0.8), center, pose).errors[0]
+    assert 'external' in gm.check_rack_mesh(ring(40), center, pose).errors[0]
+    wrong_side = gm.rack_point(pose.origin, pose.direction, pose.side, 40.0, -gear.pitch_radius)
+    assert 'wrong side' in gm.check_rack_mesh(gear, wrong_side, pose).errors[0]
+    loose = gm.rack_point(pose.origin, pose.direction, pose.side, 40.0, gear.pitch_radius + 0.5)
+    assert "isn't tangent" in gm.check_rack_mesh(gear, loose, pose).warnings[0]
+    beyond = _gear_on_rack(gear, pose, 120.0)
+    assert 'beyond the end' in gm.check_rack_mesh(gear, beyond, pose).warnings[0]
+
+
+def test_rack_pair_report():
+    report = gm.rack_pair_report(ext(30, backlash=B), gm.gear_radii(ext(30, backlash=B)), rack(backlash=B))
+    assert report.infos[0].startswith('Contact ratio') and not report.warnings
+    low = ext(8, backlash=B)
+    report = gm.rack_pair_report(low, gm.gear_radii(low), rack(backlash=B))
+    assert any('below 1.2' in w for w in report.warnings)
+    a = math.radians(14.5)
+    report = gm.rack_pair_report(ext(17, alpha=a), gm.gear_radii(ext(17, alpha=a)), rack(alpha=a))
+    assert any("rack's teeth hit" in w for w in report.warnings)
+
+
+def test_rack_factor_min_pair():
+    assert gm.rack_factor_min_pair(ext(10, backlash=B), rack(backlash=B)) is None   # no height reaches 1.2
+    gear, rk = ext(11, backlash=B), rack(backlash=B)
+    k_min = gm.rack_factor_min_pair(gear, rk)
+    assert k_min is not None and k_min > 1.0
+    g = gear.with_factor(k_min)
+    assert gm.rack_contact_ratio(g, gm.gear_radii(g), rk.with_factor(k_min)) >= gm.CONTACT_RATIO_GOOD
+    g = gear.with_factor(k_min - 0.01)
+    assert gm.rack_contact_ratio(g, gm.gear_radii(g), rk.with_factor(k_min - 0.01)) < gm.CONTACT_RATIO_GOOD
+
+
+def test_rack_record_phase():
+    record = gm.RackRecord(rack(), 'r1', offset=1.5)
+    assert record.tooth_phase == 1.5
+    parsed = gm.from_rack_attribute(gm.to_rack_attribute(gm.RackRecord(rack(), 'r1', offset=1.5, phase=4.25)))
+    assert parsed.tooth_phase == 4.25 and parsed.offset == 1.5
+    old = gm.to_rack_attribute(record).replace(', "phase_mm": 1.5', '')
+    assert 'phase_mm' not in old and gm.from_rack_attribute(old).tooth_phase == 1.5
+
+
+def test_rack_pinion_svg():
+    out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'out')
+    os.makedirs(out_dir, exist_ok=True)
+    rk = rack(backlash=B)
+    for name, side, direction in (('rack_pinion.svg', gm.LEFT, 0), ('rack_pinion_right_diag.svg', gm.RIGHT, 30)):
+        gear = ext(12, backlash=B)
+        pose = _pose(rk, direction, side, 0.8, origin=(0.0, 0.0), length=8 * rk.pitch)
+        center = _gear_on_rack(gear, pose, 3.3 * rk.pitch)
+        theta0 = gm.align_theta0_to_rack(gear, center, pose)
+        prof = gm.build_rack(rk, pose.origin, pose.direction, side, pose.length, pose.phase, 6.0)
+        gm.to_svg([prof, gm.build_profile(gear, center, theta0)], os.path.join(out_dir, name))

@@ -994,16 +994,23 @@ def check_sizing(circle_diameter: float, params: GearParams, resize: bool) -> Ch
     return check
 
 
+def _match_errors(new, partner) -> list[str]:
+    """Module, pressure angle and tooth height must match for any meshing pair (gears or a rack)."""
+    errors = []
+    if abs(new.module - partner.module) > 1e-9:
+        errors.append('Module doesn\'t match the mesh partner.')
+    if abs(new.pressure_angle - partner.pressure_angle) > 1e-9:
+        errors.append('Pressure angle doesn\'t match the mesh partner.')
+    if abs(new.height_factor - partner.height_factor) > 1e-9:
+        errors.append(f'Tooth height doesn\'t match the mesh partner ({partner.height_factor:g}).')
+    return errors
+
+
 def check_mesh(new: GearParams, new_center: Point,
                partner: GearParams, partner_center: Point, partner_radius: float) -> Check:
     """Validate a mesh pair's compatibility and placement. partner_radius is the partner circle's radius."""
     check = Check()
-    if abs(new.module - partner.module) > 1e-9:
-        check.errors.append('Module doesn\'t match the mesh partner.')
-    if abs(new.pressure_angle - partner.pressure_angle) > 1e-9:
-        check.errors.append('Pressure angle doesn\'t match the mesh partner.')
-    if abs(new.height_factor - partner.height_factor) > 1e-9:
-        check.errors.append(f'Tooth height doesn\'t match the mesh partner ({partner.height_factor:g}).')
+    check.errors += _match_errors(new, partner)
     if new.internal and partner.internal:
         check.errors.append('Two internal gears can\'t mesh.')
     if check.errors:
@@ -1394,6 +1401,9 @@ class RackParams:
     def dedendum(self) -> float:
         return (self.height_factor + 0.25) * self.module
 
+    def with_factor(self, k: float) -> 'RackParams':
+        return replace(self, height_factor=k)
+
 
 def rack_cutter(params: RackParams) -> Cutter:
     """The rack's tooth space: the same shape as the cutter that generates gear roots."""
@@ -1609,7 +1619,13 @@ class RackRecord:
     origin: Point = (0.0, 0.0)     # where the rack was drawn: the line's start, direction and length then
     direction: float = 0.0
     length: float = 0.0
-    mesh_with: str = ''            # reserved for rack-and-pinion meshing
+    mesh_with: str = ''            # gear_id of the gear it was aligned to, if any
+    phase: Optional[float] = None  # total offset of the tooth pattern: alignment + offset (None = offset)
+
+    @property
+    def tooth_phase(self) -> float:
+        """The offset the teeth were drawn with: tooth i at s = p/2 + tooth_phase + i·p."""
+        return self.offset if self.phase is None else self.phase
 
 
 def to_rack_attribute(record: RackRecord) -> str:
@@ -1630,6 +1646,7 @@ def to_rack_attribute(record: RackRecord) -> str:
         'direction_rad': record.direction,
         'length_mm': record.length,
         'mesh_with': record.mesh_with,
+        'phase_mm': record.tooth_phase,
     })
 
 
@@ -1659,9 +1676,251 @@ def from_rack_attribute(value: str) -> Optional[RackRecord]:
             direction=float(data['direction_rad']),
             length=float(data['length_mm']),
             mesh_with=str(data.get('mesh_with', '')),
+            phase=float(data['phase_mm']) if 'phase_mm' in data else None,
         )
     except (ValueError, KeyError, TypeError, AttributeError, IndexError):
         return None
+
+
+# ---------------------------------------------------------------------------
+# Rack and pinion
+# ---------------------------------------------------------------------------
+#
+# A gear meshes with a rack when its pitch circle touches the rack's pitch line on the teeth side
+# (center at h = r) and a tooth on one faces a gap on the other at the contact point C, the foot
+# of the perpendicular from the gear's center. With d = the direction from the gear's center to C
+# (= −n), gear phase p_g = frac((d − θ₀)/τ) and rack phase q = frac((s_C − p/2 − phase)/p), both
+# 0 when a tooth centerline is at C, the mesh condition is
+#
+#     p_g ≡ ½ + side · q   (mod 1)
+#
+# The gear's counter-clockwise tangent at C is side·u, and r·τ = p, so a gear tooth at arc length e
+# from C (along that tangent) lines up with the rack feature at side·e along the line.
+
+RACK_TOUCH_TOL = 1e-3       # × module: overlap this small counts as touching (B = 0 flank contact, rounding)
+
+
+@dataclass(frozen=True)
+class RackPose:
+    """Where a rack is, for meshing: its (live) pitch line, and the phase its teeth were drawn with."""
+    params: RackParams
+    origin: Point
+    direction: float
+    side: int
+    phase: float          # tooth i at s = p/2 + phase + i·p
+    length: float
+
+    @property
+    def toward_line(self) -> float:
+        """Direction from a gear on the teeth side to its contact point: −n."""
+        return math.atan2(-self.side * math.cos(self.direction), self.side * math.sin(self.direction))
+
+
+def rack_contact(pose: RackPose, center: Point) -> tuple[float, float]:
+    """(s, h) of a gear's center in the rack frame: s is where it touches the pitch line, h its height
+    above the line toward the teeth (the pitch radius, when tangent)."""
+    return rack_coords(pose.origin, pose.direction, pose.side, center)
+
+
+def rack_phase_at(pose: RackPose, s: float) -> float:
+    """Rack phase in teeth at s along the line: 0 means a tooth centerline is there."""
+    p = pose.params.pitch
+    return _frac((s - p / 2.0 - pose.phase) / p)
+
+
+def align_theta0_to_rack(gear: GearParams, center: Point, pose: RackPose) -> float:
+    """θ₀ for a gear so it meshes with the rack at its contact point."""
+    s, _ = rack_contact(pose, center)
+    q = rack_phase_at(pose, s)
+    return theta0_for_phase(pose.toward_line, _frac(0.5 + pose.side * q), gear.teeth)
+
+
+def align_rack_phase(pose: RackPose, gear: GearParams, center: Point, theta0: float) -> float:
+    """The rack phase (in [0, p)) that meshes with this gear; pose.phase is ignored."""
+    p = pose.params.pitch
+    s, _ = rack_contact(pose, center)
+    q = _frac(pose.side * (phase(pose.toward_line, theta0, gear.teeth) - 0.5))
+    return (s - p / 2.0 - q * p) % p
+
+
+def rack_mesh_error(gear: GearParams, center: Point, theta0: float, pose: RackPose) -> float:
+    """How far a gear and a rack are from the mesh condition, in teeth (0 = aligned, 0.5 = worst)."""
+    s, _ = rack_contact(pose, center)
+    off = _frac(phase(pose.toward_line, theta0, gear.teeth) - 0.5 - pose.side * rack_phase_at(pose, s))
+    return min(off, 1.0 - off)
+
+
+def check_rack_mesh(gear: GearParams, center: Point, pose: RackPose) -> Check:
+    """Validate a gear and a rack as a meshing pair: compatibility and placement."""
+    check = Check()
+    check.errors += _match_errors(gear, pose.params)
+    if gear.internal:
+        check.errors.append('A rack can only mesh with an external gear.')
+    if check.errors:
+        return check
+    s, h = rack_contact(pose, center)
+    if h < TANGENCY_TOL_MM:
+        check.errors.append("The gear is on the wrong side of the rack's line, away from its teeth. "
+                            'Flip the rack, or move the gear.')
+        return check
+    if abs(h - gear.pitch_radius) > TANGENCY_TOL_MM:
+        check.warnings.append("The circle isn't tangent to the rack's line: they won't mesh at this spacing.")
+    if s < -TANGENCY_TOL_MM or s > pose.length + TANGENCY_TOL_MM:
+        check.warnings.append("The gear touches the rack's line beyond the end of the line.")
+    return check
+
+
+def rack_contact_ratio(gear: GearParams, radii: Radii, rack: RackParams) -> float:
+    """Contact ratio of a gear (as drawn) and a rack, along the line of action through the pitch point."""
+    sa = math.sin(gear.pressure_angle)
+    rb, pitch_point = gear.base_radius, gear.pitch_radius * sa
+
+    def s(radius: float) -> float:
+        return math.sqrt(max(radius * radius - rb * rb, 0.0))
+
+    # Gear tip working down the rack's straight flank; rack tip working down the gear's involute.
+    gear_side = min(s(radii.tip) - pitch_point, rack_cutter(rack).straight_depth / sa)
+    rack_side = min(rack.addendum / sa, pitch_point - s(radii.form))
+    return max(0.0, gear_side + rack_side) / (rack.pitch * math.cos(gear.pressure_angle))
+
+
+def _rack_space_half(cut: Cutter, alpha: float, h: float) -> float:
+    """Half width of a rack's tooth space at height h (−hf ≤ h): straight flank, or the root fillet."""
+    if h >= -cut.straight_depth:
+        return cut.half_width + h * math.tan(alpha)
+    dy = h + cut.corner_depth
+    return cut.corner_x + math.sqrt(max(cut.corner_radius ** 2 - dy * dy, 0.0))
+
+
+def _inside_rack(rack: RackParams, cut: Cutter, phase_mm: float, s: float, h: float, tol: float) -> bool:
+    """Is (s, h) more than tol inside an endless rack's material (backing included)?"""
+    if h >= rack.addendum - tol:
+        return False
+    if h <= -cut.depth - tol:
+        return True
+    p = rack.pitch
+    rel = s - (phase_mm + round((s - phase_mm) / p) * p)     # from the nearest space center
+    return abs(rel) > _rack_space_half(cut, rack.pressure_angle, max(h, -cut.depth)) + tol
+
+
+def _inside_gear_by(gear: GearParams, radii: Radii, theta0: float, rho: float, angle: float, tol: float) -> bool:
+    """Is a point (polar, gear frame) more than tol (mm, along the circle) inside an external gear?"""
+    if rho <= radii.root - tol:
+        return True
+    if rho >= radii.tip - tol:
+        return False
+    rel = angle - _nearest_center(angle, theta0, gear.angular_pitch)
+    return rho * (tooth_half_angle(gear, max(rho, radii.root)) - abs(rel)) > tol
+
+
+def _rack_boundary(rack: RackParams) -> list[Point]:
+    """Points on one tooth's outline, (x from the space center on its left, h), from root to root."""
+    cut = rack_cutter(rack)
+    p, a, alpha = rack.pitch, rack.addendum, rack.pressure_angle
+    pts = []
+    for i in range(9):
+        ang = -math.pi / 2.0 + (math.pi / 2.0 - alpha) * i / 8      # fillet
+        pts.append((cut.corner_x + cut.corner_radius * math.cos(ang), -cut.corner_depth + cut.corner_radius * math.sin(ang)))
+    for i in range(1, 13):
+        h = -cut.straight_depth + (a + cut.straight_depth) * i / 12  # flank
+        pts.append((cut.half_width + h * math.tan(alpha), h))
+    left, right = cut.half_width + a * math.tan(alpha), p - cut.half_width - a * math.tan(alpha)
+    pts += [(left + (right - left) * i / 6, a) for i in range(1, 6)]  # top land
+    return pts + [(p - x, h) for x, h in pts]
+
+
+def rack_pair_collides_at(gear: GearParams, radii: Radii, center: Point, theta0: float, pose: RackPose,
+                          phases: int = 48) -> bool:
+    """Do a gear and an endless rack, placed as given, collide while the gear rolls one tooth along it?"""
+    rack = pose.params
+    cut = rack_cutter(rack)
+    p, tau, r = rack.pitch, gear.angular_pitch, gear.pitch_radius
+    gear_pts = [pt for pt, _ in _external_boundary(gear, radii)]
+    rack_pts = _rack_boundary(rack)
+    tol = RACK_TOUCH_TOL * rack.module
+    d = pose.toward_line
+    s_c, _ = rack_contact(pose, center)
+    for i in range(phases):
+        phi = i / phases * tau
+        shift = pose.side * r * phi          # the rack moves along the gear's tangent at C
+        t0 = theta0 + phi
+        for j in range(gear.teeth):
+            rot = t0 + j * tau
+            if abs(_wrap(rot - d)) > math.radians(100):
+                continue
+            c, sn = math.cos(rot), math.sin(rot)
+            for x, y in gear_pts:
+                world = (center[0] + x * c - y * sn, center[1] + x * sn + y * c)
+                s, h = rack_coords(pose.origin, pose.direction, pose.side, world)
+                if _inside_rack(rack, cut, pose.phase + shift, s, h, tol):
+                    return True
+        first = pose.phase + shift + math.floor((s_c - pose.phase - shift) / p) * p   # space center at or before C
+        for k in range(-3, 3):
+            base = first + k * p
+            for x, h in rack_pts:
+                wx, wy = rack_point(pose.origin, pose.direction, pose.side, base + x, h)
+                rho = math.hypot(wx - center[0], wy - center[1])
+                if _inside_gear_by(gear, radii, t0, rho, math.atan2(wy - center[1], wx - center[0]), tol):
+                    return True
+    return False
+
+
+def _canonical_rack_pair(gear: GearParams, rack: RackParams) -> tuple:
+    """A gear above an endless rack (teeth up, line along +x), aligned: (center, θ₀, pose)."""
+    pose = RackPose(rack, (-gear.pitch_radius - 10.0 * rack.pitch, 0.0), 0.0, LEFT, 0.0, 1e9)
+    center = (0.0, gear.pitch_radius)
+    return center, align_theta0_to_rack(gear, center, pose), pose
+
+
+@functools.lru_cache(maxsize=256)
+def rack_pair_collides(gear: GearParams, rack: RackParams, phases: int = 48) -> bool:
+    """Do a gear (as drawn) and a rack, meshed, collide over a full tooth?"""
+    center, theta0, pose = _canonical_rack_pair(gear, rack)
+    return rack_pair_collides_at(gear, gear_radii(gear), center, theta0, pose, phases)
+
+
+@functools.lru_cache(maxsize=256)
+def rack_factor_min_pair(gear: GearParams, rack: RackParams) -> Optional[float]:
+    """Smallest shared factor at which a gear and a rack reach a contact ratio of 1.2, or None."""
+    k_hi = min(factor_max(gear.with_factor(1.0)), rack_factor_max(rack.with_factor(1.0)))
+
+    def ok(k: float) -> bool:
+        g = gear.with_factor(k)
+        return rack_contact_ratio(g, gear_radii(g), rack.with_factor(k)) >= CONTACT_RATIO_GOOD
+
+    if not ok(k_hi):
+        return None
+    k = k_hi   # scan down (as _factor_min_pair does): don't assume the ratio rises steadily with k
+    while k - 0.1 >= FACTOR_SCAN_MIN:
+        if not ok(k - 0.1):
+            lo, hi = k - 0.1, k
+            for _ in range(7):
+                mid = (lo + hi) / 2.0
+                if ok(mid):
+                    hi = mid
+                else:
+                    lo = mid
+            return round(hi, 3)
+        k -= 0.1
+    return FACTOR_SCAN_MIN
+
+
+def rack_pair_report(gear: GearParams, radii: Radii, rack: RackParams) -> Check:
+    """Contact ratio and interference messages for a gear and the rack it meshes with."""
+    check = Check()
+    if rack_pair_collides(gear, rack):
+        check.warnings.append(f"The rack's teeth hit the {gear.teeth}-tooth gear. Use more teeth on the gear, "
+                              'or more backlash.')
+    cr = rack_contact_ratio(gear, radii, rack)
+    check.infos.append(f'Contact ratio {cr:.2f}')
+    if cr < CONTACT_RATIO_GOOD:
+        k_min = rack_factor_min_pair(gear, rack)
+        if k_min is not None and k_min > gear.height_factor + 1e-9:
+            fix = f'Remake the rack and the gear with a tooth height factor of at least {k_min:.2f}.'
+        else:
+            fix = 'Use more teeth on the gear.'
+        check.warnings.append(f'Contact ratio {cr:.2f} is below {CONTACT_RATIO_GOOD}. {fix}')
+    return check
 
 
 # ---------------------------------------------------------------------------
